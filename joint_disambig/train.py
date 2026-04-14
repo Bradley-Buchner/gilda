@@ -257,7 +257,11 @@ def load_model(path: str, device: str = "cpu") -> JointDisambiguator:
     """Load a saved model checkpoint from disk.
     """
     ckpt = torch.load(path, map_location=device, weights_only=True)
-    model = JointDisambiguator(**ckpt["config"])
+    model_type = ckpt.get("model_type", "JointDisambiguator")
+    if model_type == "GatedJointDisambiguator":
+        model = GatedJointDisambiguator(**ckpt["config"])
+    else:
+        model = JointDisambiguator(**ckpt["config"])
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
     return model
