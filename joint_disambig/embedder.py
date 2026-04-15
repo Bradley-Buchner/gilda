@@ -20,12 +20,80 @@ NAMESPACE_LABELS = {
     "PF": "Pfam domain",
 }
 
+# Common taxonomy IDs to species names
+ORGANISM_NAMES = {
+    "9606": "human", "10090": "mouse", "10116": "rat",
+    "9913": "cow", "9615": "dog", "9823": "pig",
+    "7955": "zebrafish", "7227": "Drosophila", "6239": "C. elegans",
+    "3702": "Arabidopsis", "559292": "yeast", "4932": "yeast",
+}
+
+
+class DescriptionLookup:
+    """Pre-built lookup table for entity descriptions from Gilda's term table.
+
+    Scans the grounder's entries once at construction time to collect:
+    - Longest 'name' status text for each (db, id) —> e.g., "estrogen receptor 1"
+        for HGNC:3467
+    - Longest synonym text for UP entries —> e.g., "Cathepsin D" for UP:P07339
+
+    This avoids scanning millions of entries per candidate at embedding time.
+    """
+
+    def __init__(self, grounder):
+        self.names = {}  # (db, id): longest name text (!= entry_name)
+        self.up_synonyms = {}  # (UP, id): longest synonym text (!= entry_name)
+
+        for norm_text, terms in grounder.entries.items():
+            for t in terms:
+                key = (t.db, t.id)
+
+                # Collect longest 'name' entry for any namespace
+                if t.status == "name":
+                    prev = self.names.get(key)
+                    if prev is None or len(t.text) > len(prev):
+                        self.names[key] = t.text
+
+                # For UP entries, also collect longest synonym text
+                # (these often contain descriptive protein names)
+                if t.db == "UP" and t.text != t.entry_name:
+                    prev = self.up_synonyms.get(key)
+                    if prev is None or len(t.text) > len(prev):
+                        self.up_synonyms[key] = t.text
+
+    def get_description(self, term) -> Optional[str]:
+        """Get the best available description for a term. Returns the longest name
+        that differs from entry_name. For UP entries, falls back to the longest
+        synonym if no name entry exists.
+        """
+        key = (term.db, term.id)
+        name = self.names.get(key)
+        if name and name != term.entry_name:
+            return name
+        if term.db == "UP":
+            syn = self.up_synonyms.get(key)
+            if syn and syn != term.entry_name:
+                return syn
+        return None
+
+
+_description_lookup: Optional[DescriptionLookup] = None
+
+
+def _get_description_lookup(grounder) -> DescriptionLookup:
+    global _description_lookup
+    if _description_lookup is None:
+        _description_lookup = DescriptionLookup(grounder)
+    return _description_lookup
+
 
 def _build_embedding_text(term, grounder=None) -> str:
-    """Build a rich text string for embedding a Gilda Term. For example, instead of embedding a
-    candidate like HGNC:3467 by only its entry_name "ESR1", embed a string that includes this
-    name plus a long-form name and a namespace label like "ESR1, estrogen receptor 1 (gene)",
-    which takes the form: "{entry_name}, {long_form_name} ({namespace_label})"
+    """Build a rich text string for embedding a Gilda Term. For example,
+    instead of embedding a candidate like HGNC:3467 by only its entry_name
+    "ESR1", embed a string that includes this name plus a long-form name
+    and a namespace label like "ESR1, estrogen receptor 1 (gene)", which takes
+    the form: "{entry_name}, {long_form_name} ({namespace_label})", If no
+    grounder is provided, returns entry_name.
 
     Params:
     -------
@@ -37,23 +105,26 @@ def _build_embedding_text(term, grounder=None) -> str:
     Returns:
     --------
     str : rich text string to be embedded
-
     """
-    parts = [term.entry_name]
-    if grounder is not None:
-        best_name = None
-        for norm_text, terms in grounder.entries.items():
-            for t in terms:
-                if (t.db == term.db and t.id == term.id
-                        and t.status == "name"
-                        and t.text != term.entry_name):
-                    if best_name is None or len(t.text) > len(best_name):
-                        best_name = t.text
-        if best_name:
-            parts.append(best_name)
+    if grounder is None:
+        return term.entry_name
 
+    lookup = _get_description_lookup(grounder)
+    parts = [term.entry_name]
+
+    # Add descriptive name if available
+    desc = lookup.get_description(term)
+    if desc:
+        parts.append(desc)
+
+    # Build namespace label with species for organism-specific entries
     ns_label = NAMESPACE_LABELS.get(term.db)
-    if ns_label:
+    if term.organism and term.organism in ORGANISM_NAMES:
+        species = ORGANISM_NAMES[term.organism]
+        if ns_label:
+            return ", ".join(parts) + f" ({species} {ns_label})"
+        return ", ".join(parts) + f" ({species})"
+    elif ns_label:
         return ", ".join(parts) + f" ({ns_label})"
     return ", ".join(parts)
 
