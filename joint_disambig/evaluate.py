@@ -386,6 +386,62 @@ def evaluate_predictions(
     return _counts_to_df(counts)
 
 
+def filter_ambiguous_mentions(
+    docs: list[DocumentExample],
+    max_score_gap: float = 0.05,
+    min_candidates: int = 2,
+    min_top_score: float = 0.3,
+) -> list[DocumentExample]:
+    """Filter documents to only include mentions where Gilda's candidate
+    list is genuinely ambiguous. A mention is considered ambiguous when it
+    has at least `min_candidates` candidates, the gap between the 1st and 2nd
+    candidate scores is at most `max_score_gap`, and the top candidate score
+    is at least `min_top_score` (to exclude poor-quality matches).
+
+    Params:
+    ------
+    docs :
+        List of DocumentExample instances.
+    max_score_gap :
+        Maximum allowed difference between the top two candidate scores.
+    min_candidates :
+        Minimum number of candidates required.
+    min_top_score :
+        Minimum score for the top candidate.
+
+    Returns:
+    --------
+    list[DocumentExample]
+        Filtered documents containing only ambiguous mentions. Documents
+        with no remaining mentions are dropped.
+    """
+    total_mentions = 0
+    kept_mentions = 0
+    filtered = []
+    for doc in docs:
+        amb_mentions = []
+        for m in doc.mentions:
+            total_mentions += 1
+            if len(m.candidates) < min_candidates:
+                continue
+            top = m.candidates[0].score
+            second = m.candidates[1].score
+            gap = top - second
+            if gap <= max_score_gap and top >= min_top_score:
+                amb_mentions.append(m)
+                kept_mentions += 1
+        if amb_mentions:
+            filtered.append(DocumentExample(
+                doc_id=doc.doc_id,
+                mentions=amb_mentions,
+            ))
+    print(f"Ambiguity filter: kept {kept_mentions}/{total_mentions} mentions "
+          f"({kept_mentions/total_mentions:.1%}) across {len(filtered)} docs "
+          f"(gap<={max_score_gap}, candidates>={min_candidates}, "
+          f"top>={min_top_score})")
+    return filtered
+
+
 def evaluate_baseline(docs: list[DocumentExample]) -> pd.DataFrame:
     """"Evaluate Gilda's default pre-disambiguation candidate ranking.
     """
@@ -474,6 +530,17 @@ if __name__ == "__main__":
                         help="Path to trained attention model")
     parser.add_argument("--embedding-cache", default="embedding_cache.pkl")
     parser.add_argument("--equivalences", default=None)
+    parser.add_argument("--ambiguous-only", action="store_true",
+                        help="Evaluate only on ambiguous mentions")
+    parser.add_argument("--max-score-gap", type=float, default=0.05,
+                        help="Max gap between top two candidate scores "
+                             "(if --ambiguous-only)")
+    parser.add_argument("--min-candidates", type=int, default=2,
+                        help="Min number of candidates for a mention "
+                             "(if --ambiguous-only)")
+    parser.add_argument("--min-top-score", type=float, default=0.3,
+                        help="Min score for the top candidate "
+                             "(if --ambiguous-only)")
     parser.add_argument("--device", default="cpu")
     args = parser.parse_args()
 
@@ -493,6 +560,14 @@ if __name__ == "__main__":
 
         docs = load_bioid_corpus(equivalences=equivalences)
         _, _, test_docs = split_by_document(docs)
+
+        if args.ambiguous_only:
+            test_docs = filter_ambiguous_mentions(
+                test_docs,
+                max_score_gap=args.max_score_gap,
+                min_candidates=args.min_candidates,
+                min_top_score=args.min_top_score,
+            )
 
         all_results = {}
 
