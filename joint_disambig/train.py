@@ -116,6 +116,18 @@ def compute_gate_features(doc: DocumentExample) -> Optional[torch.Tensor]:
     return torch.tensor(features, dtype=torch.float32)
 
 
+def _forward_model(model, embs, gs, mids, doc, device, cross_mention_only):
+    """Call model.forward() with the right arguments for the model type.
+    """
+    if isinstance(model, GatedJointDisambiguator):
+        gate_feats = compute_gate_features(doc)
+        if gate_feats is None:
+            return None
+        return model(embs, gs, mids, gate_feats.to(device),
+                     cross_mention_only=cross_mention_only)
+    return model(embs, gs, mids, cross_mention_only=cross_mention_only)
+
+
 def train(
     train_docs: list[DocumentExample],
     val_docs: list[DocumentExample],
@@ -129,7 +141,8 @@ def train(
     cross_mention_only: bool = False,
 ) -> JointDisambiguator:
     """Train a model with early stopping on validation loss and return the
-    best model checkpoint.
+    best model checkpoint. Handles both JointDisambiguator and
+    GatedJointDisambiguator.
     """
     device = torch.device(device)
     model = model.to(device)
@@ -149,8 +162,10 @@ def train(
             if batch is None:
                 continue
             embs, gs, mids, golds = [t.to(device) for t in batch]
-            scores = model(embs, gs, mids,
-                           cross_mention_only=cross_mention_only)
+            scores = _forward_model(model, embs, gs, mids, doc, device,
+                                    cross_mention_only)
+            if scores is None:
+                continue
             loss = compute_loss(scores, mids, golds)
             if loss.item() == 0.0:
                 continue
@@ -170,8 +185,10 @@ def train(
                 if batch is None:
                     continue
                 embs, gs, mids, golds = [t.to(device) for t in batch]
-                scores = model(embs, gs, mids,
-                               cross_mention_only=cross_mention_only)
+                scores = _forward_model(model, embs, gs, mids, doc, device,
+                                        cross_mention_only)
+                if scores is None:
+                    continue
                 loss = compute_loss(scores, mids, golds)
                 val_loss += loss.item()
                 n_val += 1
@@ -204,7 +221,8 @@ def predict_document(
     cross_mention_only: bool = False,
 ) -> dict[str, list]:
     """Run inference on a single document and return {mention_text: re-ranked
-    ScoredMatch list}.
+    ScoredMatch list}. Handles both JointDisambiguator and
+    GatedJointDisambiguator.
     """
     device_t = torch.device(device)
     model = model.to(device_t)
@@ -219,11 +237,15 @@ def predict_document(
 
     embs, gs, mids, _ = [t.to(device_t) for t in batch]
     with torch.no_grad():
-        scores = model(embs, gs, mids,
-                       cross_mention_only=cross_mention_only).cpu().numpy()
+        scores = _forward_model(model, embs, gs, mids, doc, device_t,
+                                cross_mention_only)
+        if scores is None:
+            for m in doc.mentions:
+                results[m.text] = m.candidates
+            return results
+        scores = scores.cpu().numpy()
 
     # Map scores back to mentions and re-rank candidates
-    m_id = 0
     score_idx = 0
     for mention in doc.mentions:
         if not mention.candidates:
@@ -234,22 +256,26 @@ def predict_document(
         ranked_indices = np.argsort(-mention_scores)
         results[mention.text] = [mention.candidates[i] for i in ranked_indices]
         score_idx += n_cands
-        m_id += 1
 
     return results
 
 
-def save_model(model: JointDisambiguator, path: str):
-    """Save model checkpoint to disk.
+def save_model(model: JointDisambiguator, path: str,
+               embedding_mode: str = "plain"):
+    """Save model checkpoint to disk with model type and embedding mode
+    metadata.
     """
+    model_type = type(model).__name__
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     torch.save({
         "state_dict": model.state_dict(),
+        "model_type": model_type,
         "config": {
             "embed_dim": model.input_proj.in_features - 1,
             "hidden_dim": model.input_proj.out_features,
             "n_heads": model.attention.num_heads,
         },
+        "embedding_mode": embedding_mode,
     }, path)
 
 
@@ -270,42 +296,54 @@ def load_model(path: str, device: str = "cpu") -> JointDisambiguator:
 
 if __name__ == "__main__":
     import argparse
+    import json
 
-    parser = argparse.ArgumentParser(description="Train joint disambiguation model")
-    parser.add_argument("--epochs", type=int, default=20)
+    parser = argparse.ArgumentParser(
+        description="Train joint disambiguation model")
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--patience", type=int, default=5)
+    parser.add_argument("--patience", type=int, default=7)
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--output", default="joint_disambig_model.pt")
-    parser.add_argument("--embedding-cache", default="embedding_cache.pkl")
-    parser.add_argument("--equivalences", default=None, help="Path to "
-                                                             "equivalences.json")
+    parser.add_argument("--output", default="joint_disambig/model_checkpoint.pt")
+    parser.add_argument("--embedding-cache",
+                        default="joint_disambig/embedding_cache_rich.pkl")
+    parser.add_argument("--equivalences", default=None,
+                        help="Path to equivalences.json")
+    parser.add_argument("--model-type",
+                        choices=["plain", "gated"], default="gated",
+                        help="Model variant: 'plain' for JointDisambiguator, "
+                             "'gated' for GatedJointDisambiguator")
     args = parser.parse_args()
 
     from .data import load_bioid_corpus, split_by_document, report_statistics
-    import json
+    from gilda.grounder import Grounder
 
     equivalences = {}
     if args.equivalences and os.path.exists(args.equivalences):
         with open(args.equivalences) as f:
             equivalences = json.load(f)
 
-    docs = load_bioid_corpus(equivalences=equivalences)
+    grounder = Grounder()
+    docs = load_bioid_corpus(grounder=grounder, equivalences=equivalences)
     report_statistics(docs)
     train_docs, val_docs, test_docs = split_by_document(docs)
     print(f"Split: {len(train_docs)} train, {len(val_docs)} val, "
           f"{len(test_docs)} test")
 
-    embedder = CandidateEmbedder(device=args.device,
-                                 cache_path=args.embedding_cache)
-    cache = precompute_embeddings(train_docs + val_docs + test_docs, embedder,
-                                  args.embedding_cache)
+    # Rich embeddings (pass grounder for full names + species labels)
+    embedder = CandidateEmbedder(device=args.device, grounder=grounder)
+    cache = precompute_embeddings(train_docs + val_docs + test_docs,
+                                  embedder, args.embedding_cache)
 
-    model = JointDisambiguator(embed_dim=embedder.embed_dim)
+    if args.model_type == "gated":
+        model = GatedJointDisambiguator(embed_dim=embedder.embed_dim)
+    else:
+        model = JointDisambiguator(embed_dim=embedder.embed_dim)
+
     model = train(
         train_docs, val_docs, cache, model,
         epochs=args.epochs, lr=args.lr, patience=args.patience,
         device=args.device,
     )
-    save_model(model, args.output)
+    save_model(model, args.output, embedding_mode="rich")
     print(f"Model saved to {args.output}")
