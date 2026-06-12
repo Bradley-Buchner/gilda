@@ -218,7 +218,8 @@ class BioIDBenchmarker:
             read_csv_kwargs=dict(sep=',', low_memory=False),
         )
         # Split entries with multiple groundings then normalize ids
-        df.loc[:, 'obj'] = df['obj'].apply(self._normalize_ids)
+        # df.loc[:, 'obj'] = df['obj'].apply(self._normalize_ids)
+        df['obj'] = df['obj'].apply(self._normalize_ids)
         # Add synonyms of gold standard groundings to help match more things
         df.loc[:, 'obj_synonyms'] = df['obj'].apply(self.get_synonym_set)
         # Create column for entity type
