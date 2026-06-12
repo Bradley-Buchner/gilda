@@ -184,8 +184,9 @@ def compute_loss(
     scores: Tensor,
     mention_ids: Tensor,
     gold_indices: Tensor,
+    temperature: float = 1.0,
 ) -> Tensor:
-    """For computing per-mention cross-entropy loss and averaging over valid mentions.
+    """Computes per-mention cross-entropy loss and averages over valid mentions.
 
     Params:
     -------
@@ -197,6 +198,11 @@ def compute_loss(
         The index of the correct candidate within each mention's candidates. A
         value of -1 means the true grounding isn't in the candidate list and that
         mention's candidates are excluded from the loss.
+    temperature : float
+        Denominator that divides model scores before the softmax to sharpen the
+        distribution (when < 1), which restores gradient magnitude if the scores have
+        a narrow range. Ranking within a mention is invariant to this, so evaluation is
+        unaffected and only the training gradients change. Default is 1.0.
 
     Returns:
     --------
@@ -211,7 +217,7 @@ def compute_loss(
         mention_scores = scores[mask]
         if mention_scores.shape[0] == 0:
             continue
-        log_probs = F.log_softmax(mention_scores, dim=0)
+        log_probs = F.log_softmax(mention_scores / temperature, dim=0)
         losses.append(-log_probs[gold_idx])
     if not losses:
         return torch.tensor(0.0, requires_grad=True, device=scores.device)
