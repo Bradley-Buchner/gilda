@@ -139,6 +139,7 @@ def train(
     patience: int = 5,
     device: str = "cpu",
     cross_mention_only: bool = False,
+    temperature: float = 1.0
 ) -> JointDisambiguator:
     """Train a model with early stopping on validation loss and return the
     best model checkpoint. Handles both JointDisambiguator and
@@ -313,6 +314,9 @@ if __name__ == "__main__":
                         choices=["plain", "gated"], default="gated",
                         help="Model variant: 'plain' for JointDisambiguator, "
                              "'gated' for GatedJointDisambiguator")
+    parser.add_argument("--temperature", type=float, default=1.0,
+                        help="Temperature param for sharpening the logit"
+                             "distribution")
     args = parser.parse_args()
 
     from .data import load_bioid_corpus, split_by_document, report_statistics
@@ -343,7 +347,7 @@ if __name__ == "__main__":
     model = train(
         train_docs, val_docs, cache, model,
         epochs=args.epochs, lr=args.lr, patience=args.patience,
-        device=args.device,
+        device=args.device, temperature=args.temperature
     )
     save_model(model, args.output, embedding_mode="rich")
     print(f"Model saved to {args.output}")
