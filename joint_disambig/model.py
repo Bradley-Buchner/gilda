@@ -3,7 +3,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import Tensor
 
 
 class JointDisambiguator(nn.Module):
@@ -44,11 +43,11 @@ class JointDisambiguator(nn.Module):
 
     def forward(
         self,
-        embeddings: Tensor,
-        gilda_scores: Tensor,
-        mention_ids: Tensor,
+        embeddings: torch.Tensor,
+        gilda_scores: torch.Tensor,
+        mention_ids: torch.Tensor,
         cross_mention_only: bool = False,
-    ) -> Tensor:
+    ) -> torch.Tensor:
         """Score all candidates jointly.
 
         Params:
@@ -128,12 +127,12 @@ class GatedJointDisambiguator(nn.Module):
 
     def forward(
         self,
-        embeddings: Tensor,
-        gilda_scores: Tensor,
-        mention_ids: Tensor,
-        gate_features: Tensor,
+        embeddings: torch.Tensor,
+        gilda_scores: torch.Tensor,
+        mention_ids: torch.Tensor,
+        gate_features: torch.Tensor,
         cross_mention_only: bool = False,
-    ) -> Tensor:
+    ) -> torch.Tensor:
         """Score all candidates jointly with a learned confidence gate.
 
         Params:
@@ -181,11 +180,11 @@ class GatedJointDisambiguator(nn.Module):
 
 
 def compute_loss(
-    scores: Tensor,
-    mention_ids: Tensor,
-    gold_indices: Tensor,
+    scores: torch.Tensor,
+    mention_ids: torch.Tensor,
+    gold_indices: torch.Tensor,
     temperature: float = 1.0,
-) -> Tensor:
+) -> torch.Tensor:
     """Computes per-mention cross-entropy loss and averages over valid mentions.
 
     Params:
@@ -206,7 +205,7 @@ def compute_loss(
 
     Returns:
     --------
-    loss : scalar tensor
+    loss : scalar torch.Tensor
     """
     losses = []
     for m_id in range(gold_indices.shape[0]):
