@@ -41,20 +41,18 @@ class DescriptionLookup:
     """
 
     def __init__(self, grounder):
-        self.names = {}  # (db, id): longest name text (!= entry_name)
-        self.up_synonyms = {}  # (UP, id): longest synonym text (!= entry_name)
+        self.names = {}  # (db, id): longest name that isn't entry_name
+        self.up_synonyms = {}  # (UP, id): longest synonym that isn't entry_name
 
         for norm_text, terms in grounder.entries.items():
             for t in terms:
                 key = (t.db, t.id)
-
-                # Collect longest 'name' entry for any namespace
                 if t.status == "name":
                     prev = self.names.get(key)
                     if prev is None or len(t.text) > len(prev):
                         self.names[key] = t.text
 
-                # For UP entries, also collect longest synonym text
+                # Also collect longest synonym text for UP entries
                 # (these often contain descriptive protein names)
                 if t.db == "UP" and t.text != t.entry_name:
                     prev = self.up_synonyms.get(key)
@@ -93,7 +91,7 @@ def _build_embedding_text(term, grounder=None) -> str:
     "ESR1", embed a string that includes this name plus a long-form name
     and a namespace label like "ESR1, estrogen receptor 1 (gene)", which takes
     the form: "{entry_name}, {long_form_name} ({namespace_label})", If no
-    grounder is provided, returns entry_name.
+    grounder is provided, just returns entry_name.
 
     Params:
     -------
@@ -139,7 +137,7 @@ class CandidateEmbedder:
     device :
         'cpu', 'mps', or 'cuda'.
     cache_path :
-        If this is provided, persist the embedding cache to this pickle file.
+        Optional embedding cache location
     grounder :
         Optional Gilda Grounder instance for looking up full entity names
         from the term table. If provided, allows for embedding richer entity texts
@@ -182,7 +180,7 @@ class CandidateEmbedder:
         return np.concatenate(all_vecs, axis=0)
 
     def embed_text(self, text: str) -> np.ndarray:
-        """Embed a single text string. Returns 1-D array.
+        """Embed a single text string.
         """
         return self.embed_texts([text])[0]
 
