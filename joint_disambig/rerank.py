@@ -7,11 +7,20 @@ from .model import GatedJointDisambiguator
 class JointReranker(object):
     """Jointly re-ranks ScoredMatch lists from multiple ground() calls.
     """
-    def __init__(self, model, grounder, device="cpu", cache=None):
+    def __init__(self, model, grounder=None, device="cpu", cache=None,
+                 embedder=None):
         self.model = model.to(device)
-        self.embedder = CandidateEmbedder(device=device, grounder=grounder)
+        self.grounder = grounder
+        self._embedder = embedder
         self.device = device
         self.cache = dict(cache or {})
+
+    @property
+    def embedder(self):
+        if self._embedder is None:
+            self._embedder = CandidateEmbedder(device=self.device,
+                                               grounder=self.grounder)
+        return self._embedder
 
     @classmethod
     def from_checkpoint(cls, path, grounder, device="cpu", cache=None):
