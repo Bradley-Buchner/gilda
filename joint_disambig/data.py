@@ -334,6 +334,89 @@ def expand_gold_curies(db_ids, benchmarker=None, umls_crosswalk=None) -> set[str
     return benchmarker.get_synonym_set(seeds)
 
 
+# === For cross-dataset deduplication and overlap handling ===
+
+# Sources whose doc id is a PMC id (others use PMID).
+_PMC_SOURCES = {"nlmchem", "bioid"}
+
+def canonical_doc_key(doc) -> str:
+    prefix = "PMC" if doc.source in _PMC_SOURCES else "PMID"
+    return f"{prefix}:{doc.doc_id}"
+
+# Set split priority in case of overlap (default to train)
+_SPLIT_RANK = {"test": 3, "validation": 2, "train": 1}
+
+def _pick_split(splits) -> str:
+    return max((s for s in splits if s in _SPLIT_RANK),
+               key=lambda s: _SPLIT_RANK[s], default="train")
+
+def resolve_cross_dataset_overlap(docs, merge: bool = True,
+                                  verbose: bool = True):
+    """Handle cases where multiple documents refer to the same source article. Make
+    sure each canonical document is assigned to one split and identical-offset mentions
+    are merged into one.
+    """
+    by_key = defaultdict(list)
+    for d in docs:
+        by_key[canonical_doc_key(d)].append(d)
+
+    n_overlap = n_doc_merged = n_collapsed = n_multi_gold = n_reassigned = 0
+    out_docs = []
+
+    for key, dlist in by_key.items():
+        split = _pick_split([d.split for d in dlist])
+        n_reassigned += sum(1 for d in dlist if d.split != split)
+        if len(dlist) > 1:
+            n_overlap += 1
+            n_doc_merged += len(dlist) - 1
+
+        # Gather mentions across all docs for an article
+        all_mentions = [m for d in dlist for m in d.mentions]
+        sources = sorted({d.source for d in dlist})
+
+        if merge:
+            grouped = defaultdict(list)
+            order = []
+            for m in all_mentions:
+                gkey = tuple(m.offsets) if m.offsets else ("__nooff__", id(m))
+                if gkey not in grouped:
+                    order.append(gkey)
+                grouped[gkey].append(m)
+
+            mentions = []
+            for gkey in order:
+                ms = grouped[gkey]
+                base = ms[0]
+                if len(ms) > 1:
+                    n_collapsed += len(ms) - 1
+                    for other in ms[1:]:
+                        base.gold_synonyms |= other.gold_synonyms
+                        base.gold_curies |= other.gold_curies
+                        base.source_datasets |= other.source_datasets
+                    base.gold_index = None
+                    assign_gold_index(base)
+                    if len(base.gold_curies) > 1:
+                        n_multi_gold += 1
+                mentions.append(base)
+        else:
+            mentions = all_mentions
+
+        out_docs.append(DocumentExample(
+            doc_id=key,
+            mentions=mentions,
+            source="+".join(sources),
+            split=split,
+        ))
+
+    if verbose:
+        print(f"[dedup] {n_overlap} articles in >= 2 datasets | "
+              f"{n_doc_merged} docs merged | {n_collapsed} mentions"
+              f" collapsed | {n_multi_gold} spans with multi-source gold | "
+              f"{n_reassigned} split reassignments (leakage guard)")
+
+    return out_docs
+
+
 def report_statistics(examples: list[DocumentExample]) -> dict:
     """Print and return summary statistics on the corpus
     """
