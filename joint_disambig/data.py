@@ -194,6 +194,22 @@ def split_by_document(
     return train_docs, val_docs, test_docs
 
 
+def make_splits(docs):
+    """Partition a corpus into train, validation, and test sets by each document's
+    assigned split.
+    """
+    train = [d for d in docs if d.split == "train"]
+    val = [d for d in docs if d.split == "validation"]
+    test = [d for d in docs if d.split == "test"]
+    unsplit = [d for d in docs if d.split not in ("train", "validation", "test")]
+    if unsplit:
+        train_extra, val_extra, test_extra = split_by_document(unsplit)
+        train.extend(train_extra)
+        val.extend(val_extra)
+        test.extend(test_extra)
+    return train, val, test
+
+
 
 def _normalize_bigbio_curie(curie: str) -> list[str]:
     """Convert a BigBio gold curie to Gilda convention. Simple string
