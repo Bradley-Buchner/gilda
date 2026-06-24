@@ -142,22 +142,14 @@ def load_bioid_corpus(
                     gold_curies=set(row["obj"]),
                     gold_synonyms=set(row["obj_synonyms"]),
                 )
-                for i, cand in enumerate(candidates):
-                    curie = f"{cand.term.db}:{cand.term.id}"
-                    if curie in mention.gold_synonyms:
-                        mention.gold_index = i
-                        break
+                assign_gold_index(mention)
                 seen_texts[text] = mention
             else:
                 existing = seen_texts[text]
                 existing.gold_curies.update(row["obj"])
                 existing.gold_synonyms.update(row["obj_synonyms"])
                 if existing.gold_index is None:
-                    for i, cand in enumerate(existing.candidates):
-                        curie = f"{cand.term.db}:{cand.term.id}"
-                        if curie in existing.gold_synonyms:
-                            existing.gold_index = i
-                            break
+                    assign_gold_index(existing)
         doc.mentions = list(seen_texts.values())
         if doc.mentions:
             documents.append(doc)
