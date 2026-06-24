@@ -76,6 +76,18 @@ def _get_benchmarker(
     return _benchmarker
 
 
+def assign_gold_index(mention: MentionExample) -> None:
+    """Set mention.gold_index to the position of the first candidate
+    whose curie is in gold_synonyms, or None if no candidate matches.
+    """
+    if mention.gold_index is not None:
+        return
+    for i, cand in enumerate(mention.candidates):
+        if f"{cand.term.db}:{cand.term.id}" in mention.gold_synonyms:
+            mention.gold_index = i
+            return
+
+
 def load_bioid_corpus(
     grounder: Optional[Grounder] = None,
     equivalences: Optional[dict] = None,
