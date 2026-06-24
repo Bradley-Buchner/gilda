@@ -456,3 +456,88 @@ def report_statistics(examples: list[DocumentExample]) -> dict:
     for etype, count in sorted(type_counts.items(), key=lambda x: -x[1]):
         print(f"  {etype}: {count}")
     return stats
+
+
+# === Entity type classification ===
+
+def _classify_entity_type(obj: list[str], obj_synonyms: set[str]) -> str:
+    """Classify entity type (for the BioID corpus, just distinguishing Human
+    vs Nonhuman Gene)
+    """
+    etype = _get_entity_type(obj)
+    if etype == "Gene":
+        if any(s.startswith("HGNC") for s in obj_synonyms):
+            return "Human Gene"
+        return "Nonhuman Gene"
+    return etype
+
+
+# Map each BigBio dataset's entity types to names that match those used by
+# BioIDBenchmarker._get_entity_type for making grouped evaluation tables
+
+_BIGBIO_TYPE_MAP = {
+    "bc5cdr": {"Chemical": "Small Molecule", "Disease": "Disease"},
+    "nlmchem": {"Chemical": "Small Molecule"},
+    "ncbi_disease": {
+        "SpecificDisease": "Disease", "DiseaseClass": "Disease",
+        "Modifier": "Disease", "CompositeMention": "Disease",
+    },
+    "gnormplus": {"Gene": "Gene", "FamilyName": "Gene"}
+}
+
+_UMLS_TUI_GROUP = {
+    "T103": "Small Molecule", # Chemical
+    "T033": "Disease", "T037": "Disease", # Finding, Injury or Poisoning
+    "T038": "Biological Function", # Biologic Function (some disease-like)
+    "T017": "Tissue/Organ", "T022": "Tissue/Organ", "T031": "Tissue/Organ",  # Anatomical Structure, Body System, Body Substance
+    "T005": "Taxon", "T007": "Taxon", "T204": "Taxon", # Virus, Bacterium, Eukaryote
+}
+
+def classify_entity_type_bigbio(dataset: str, type_list, gold_synonyms) -> str:
+    """Assigns an entity_type label for a BigBio mention.
+
+    Params:
+    -------
+    dataset: str
+        Name of the dataset (e.g., "bc5cdr")
+    type_list: list[str]
+        The mention's `type` column (a list)
+    gold_synonyms: set[str]
+        The mention's expanded gold curies
+
+    Returns:
+    --------
+    Entity type label
+    """
+    if not isinstance(type_list, (list, tuple, set)):
+        type_list = [type_list]
+
+    # Group mentions in MedMentions via the semantic-group table _UMLS_TUI_GROUP.
+    if dataset.startswith("medmentions"):
+        for t in type_list:
+            if t in _UMLS_TUI_GROUP:
+                label = _UMLS_TUI_GROUP[t]
+                if label == "Gene":
+                    return ("Human Gene"
+                            if any(s.startswith("HGNC") for s in gold_synonyms)
+                            else "Nonhuman Gene")
+                return label
+        return "unknown"
+
+    mapping = _BIGBIO_TYPE_MAP.get(dataset, {})
+
+    # Loop over datasets's `type` column
+    label = None
+    for t in type_list:
+        if t in mapping:
+            label = mapping[t]
+            break
+    if label is None:
+        label = "unknown"
+
+    # Mirror _classify_entity_type's splitting of human and non-human genes
+    if label == "Gene":
+        if any(s.startswith("HGNC") for s in gold_synonyms):
+            return "Human Gene"
+        return "Nonhuman Gene"
+    return label
