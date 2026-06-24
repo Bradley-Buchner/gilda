@@ -159,19 +159,172 @@ def load_bioid_corpus(
     return documents
 
 
-def _classify_entity_type(obj: list[str], obj_synonyms: set[str]) -> str:
-    """Classify entity type (for the BioID corpus, just distinguishing Human
-    vs Nonhuman Gene)
+# === BigBio data loading ===
+def load_bigbio_corpus(
+        dataset_name: str,
+        mentions_df,
+        grounder: Optional[Grounder] = None,
+        equivalences: Optional[dict] = None,
+        top_k: int = 20,
+        cache_path: Optional[str] = None,
+        exclude_types=("CompositeMention",),
+        umls_crosswalk: Optional[dict] = None,
+        drop_unknown: bool = False,
+) -> list[DocumentExample]:
+    """Load one BigBio dataset from its flattened parquet mention table into a
+    DocumentExample list like load_bioid_corpus.
+
+    drop_unknown: if True, skip mentions classified as "unknown" (e.g. MedMentions
+    TUIs outside _UMLS_TUI_GROUP). Default is False.
     """
-    etype = _get_entity_type(obj)
-    if etype == "Gene":
-        if any(s.startswith("HGNC") for s in obj_synonyms):
-            return "Human Gene"
-        return "Nonhuman Gene"
-    return etype
+    import pickle
+    if cache_path and os.path.exists(cache_path):
+        with open(cache_path, "rb") as f:
+            docs = pickle.load(f)
+        print(f"Loaded cached {dataset_name} corpus ({len(docs)} docs) "
+              f"from {cache_path}")
+        return docs
+
+    if grounder is None:
+        grounder = Grounder()
+    benchmarker = _get_benchmarker(grounder, equivalences)
+
+    # Drop unwanted annotation types
+    if exclude_types:
+        excl = set(exclude_types)
+        keep = mentions_df["type"].apply(lambda t: not (set(map(str, t)) & excl))
+        dropped = int((~keep).sum())
+        mentions_df = mentions_df[keep]
+        if dropped:
+            print(f"{dataset_name}: excluded {dropped} mentions of "
+                  f"types {sorted(excl)}")
+
+    documents = []
+    for doc_id, group in tqdm(mentions_df.groupby("document_id"),
+                              desc=f"{dataset_name} docs"):
+        split = str(group["split"].iloc[0])
+        doc = DocumentExample(doc_id=str(doc_id), source=dataset_name, split=split)
+        for _, row in group.iterrows():
+            db_ids = list(row["db_ids"])
+            type_list = list(row["type"])
+            gold_synonyms = expand_gold_curies(db_ids, benchmarker,
+                                               umls_crosswalk=umls_crosswalk)
+            entity_type = classify_entity_type_bigbio(
+                dataset_name, type_list, gold_synonyms)
+            if drop_unknown and entity_type == "unknown":
+                continue                         # skip ungroundable concept types
+
+            text = row["text"]
+            offsets = [tuple(o) for o in row["offsets"]]
+            candidates = grounder.ground(text)[:top_k]
+
+            mention = MentionExample(
+                text=text,
+                entity_type=entity_type,
+                candidates=candidates,
+                gold_curies=set(db_ids),
+                gold_synonyms=gold_synonyms,
+                offsets=offsets,
+                source_datasets={dataset_name},
+            )
+            assign_gold_index(mention)
+            doc.mentions.append(mention)
+
+        if doc.mentions:
+            documents.append(doc)
+
+    print(f"{dataset_name}: {len(documents)} docs, "
+          f"{sum(len(d.mentions) for d in documents)} mentions")
+
+    if cache_path:
+        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+        with open(cache_path, "wb") as f:
+            pickle.dump(documents, f)
+        print(f"Cached {dataset_name} corpus to {cache_path}")
+    return documents
 
 
-# For the train/val/test split
+# === For single corpus building ===
+
+_BIGBIO_PARQUET_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir,
+    "data", "benchmark_mentions",
+)
+
+def load_corpus(
+        datasets: list[str],
+        grounder: Optional[Grounder] = None,
+        equivalences: Optional[dict] = None,
+        parquet_dir: Optional[str] = None,
+        corpus_cache_dir: str = "joint_disambig/corpus_cache",
+        merged_cache: Optional[str] = None,
+        top_k: int = 20,
+        dedup: bool = True,
+) -> list[DocumentExample]:
+    """Build a combined corpus from one or more sources.
+    """
+    import pickle
+    if merged_cache and os.path.exists(merged_cache):
+        with open(merged_cache, "rb") as f:
+            docs = pickle.load(f)
+        print(f"Loaded merged corpus ({len(docs)} docs) from {merged_cache}")
+        return docs
+
+    if grounder is None:
+        grounder = Grounder()
+    if parquet_dir is None:
+        parquet_dir = _BIGBIO_PARQUET_DIR
+
+    # Load the prebuilt UMLS crosswalk if any MedMentions source is requested.
+    umls_crosswalk = None
+    if any(d.startswith("medmentions") for d in datasets):
+        cw_path = os.path.join(corpus_cache_dir, "umls_crosswalk.json")
+        if not os.path.exists(cw_path):
+            raise FileNotFoundError(
+                f"UMLS crosswalk not found at {cw_path}; build it once with "
+                f"build_umls_crosswalk(<MRCONSO.RRF>, cache_path='{cw_path}').")
+        with open(cw_path) as f:
+            umls_crosswalk = {k: set(v) for k, v in json.load(f).items()}
+        print(f"Loaded UMLS crosswalk ({len(umls_crosswalk)} CUIs)")
+
+    all_docs: list[DocumentExample] = []
+    for name in datasets:
+        if name == "bioid":
+            bioid_docs = load_bioid_corpus(grounder=grounder, equivalences=equivalences)
+            train, val, test = split_by_document(bioid_docs)
+            for d in train:
+                d.source, d.split = "bioid", "train"
+            for d in val:
+                d.source, d.split = "bioid", "validation"
+            for d in test:
+                d.source, d.split = "bioid", "test"
+            all_docs.extend(bioid_docs)
+        else:
+            import pandas as pd
+            path = os.path.join(parquet_dir, f"{name}.parquet")
+            df = pd.read_parquet(path)
+            cache_path = os.path.join(corpus_cache_dir, f"{name}.pkl")
+            docs = load_bigbio_corpus(name, df, grounder=grounder,
+                                      equivalences=equivalences, top_k=top_k,
+                                      umls_crosswalk=umls_crosswalk,
+                                      cache_path=cache_path)
+            all_docs.extend(docs)
+
+    if dedup:
+        all_docs = resolve_cross_dataset_overlap(all_docs)
+
+    print(f"Combined corpus: {len(all_docs)} docs, "
+          f"{sum(len(d.mentions) for d in all_docs)} mentions")
+    if merged_cache:
+        os.makedirs(os.path.dirname(merged_cache) or ".", exist_ok=True)
+        with open(merged_cache, "wb") as f:
+            pickle.dump(all_docs, f)
+        print(f"Cached merged corpus to {merged_cache}")
+
+    return all_docs
+
+
+# === For the train/val/test split ===
 
 def split_by_document(
     examples: list[DocumentExample],
