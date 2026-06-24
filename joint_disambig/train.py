@@ -220,7 +220,7 @@ if __name__ == "__main__":
         description="Train joint disambiguation model")
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--patience", type=int, default=7)
+    parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--output", default="joint_disambig/model_checkpoint.pt")
     parser.add_argument("--embedding-cache",
@@ -234,10 +234,15 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=1.0,
                         help="Temperature param for sharpening the logit"
                              "distribution")
+    parser.add_argument("--datasets", nargs="+", default=["bioid"],
+                        help="Sources to combine, e.g. 'bioid bc5cdr nlmchem "
+                             "ncbi_disease'. Default is 'bioid' (original pipeline).")
+    parser.add_argument("--corpus-cache", default=None,
+                        help="Path to cache or load the merged corpus pickle "
+                             "(skips re-grounding on re-runs).")
     args = parser.parse_args()
 
-    from .data import load_bioid_corpus, split_by_document, report_statistics
-    from gilda.grounder import Grounder
+    from .data import load_corpus, make_splits, report_statistics
 
     equivalences = {}
     if args.equivalences and os.path.exists(args.equivalences):
@@ -245,9 +250,11 @@ if __name__ == "__main__":
             equivalences = json.load(f)
 
     grounder = Grounder()
-    docs = load_bioid_corpus(grounder=grounder, equivalences=equivalences)
+    docs = load_corpus(args.datasets, grounder=grounder,
+                       equivalences=equivalences,
+                       merged_cache=args.corpus_cache)
     report_statistics(docs)
-    train_docs, val_docs, test_docs = split_by_document(docs)
+    train_docs, val_docs, test_docs = make_splits(docs)
     print(f"Split: {len(train_docs)} train, {len(val_docs)} val, "
           f"{len(test_docs)} test")
 
