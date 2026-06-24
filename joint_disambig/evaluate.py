@@ -513,6 +513,82 @@ def compare_methods(results: dict[str, pd.DataFrame]) -> pd.DataFrame:
         base[f"{name}_Delta"] = base[f"{name}_Correct"] - base[base_col]
     return base
 
+def comparison_table(docs, predictions):
+    """Generates a comparison table with per entity_type Total, Gilda F1,
+    Attn F1, Gains, Losses, and Net.
+    """
+    from collections import defaultdict
+    agg = defaultdict(lambda: {"total": 0, "g_has": 0, "g_corr": 0,
+                               "a_has": 0, "a_corr": 0, "gains": 0, "losses": 0})
+
+    def curie(c):
+        return f"{c.term.db}:{c.term.id}"
+
+    for doc in docs:
+        dp = predictions.get(doc.doc_id, {})
+        for m in doc.mentions:
+            r = agg[m.entity_type]
+            r["total"] += 1
+            base = m.candidates
+            attn = dp.get(m.text, m.candidates)
+            b_ok = bool(base) and curie(base[0]) in m.gold_synonyms
+            a_ok = bool(attn) and curie(attn[0]) in m.gold_synonyms
+            r["g_has"] += bool(base)
+            r["a_has"] += bool(attn)
+            r["g_corr"] += b_ok
+            r["a_corr"] += a_ok
+            r["gains"] += (a_ok and not b_ok)
+            r["losses"] += (b_ok and not a_ok)
+
+    def f1(corr, has, total):
+        p = corr / has if has else 0
+        rec = corr / total if total else 0
+        return round(2 * p * rec / (p + rec), 3) if (p + rec) else 0
+
+    def gl_ratio(gains, losses):
+        if losses == 0:
+            return float("inf") if gains else 0.0
+        return round(gains / losses, 2)
+
+    rows, tot = [], defaultdict(int)
+    for et in sorted(agg):
+        r = agg[et]
+        for k in r:
+            tot[k] += r[k]
+        rows.append({
+            "Entity Type": et, "Total": r["total"],
+            "Gilda F1": f1(r["g_corr"], r["g_has"], r["total"]),
+            "Attn F1": f1(r["a_corr"], r["a_has"], r["total"]),
+            "Gains": r["gains"],
+            "Losses": r["losses"],
+            "Net": r["gains"] - r["losses"],
+            "G/L": gl_ratio(r["gains"], r["losses"]),
+        })
+    rows.append({
+        "Entity Type": "Total", "Total": tot["total"],
+        "Gilda F1": f1(tot["g_corr"], tot["g_has"], tot["total"]),
+        "Attn F1": f1(tot["a_corr"], tot["a_has"], tot["total"]),
+        "Gains": tot["gains"],
+        "Losses": tot["losses"],
+        "Net": tot["gains"] - tot["losses"],
+        "G/L": gl_ratio(tot["gains"], tot["losses"]),
+    })
+    import pandas as pd
+    return pd.DataFrame(rows)
+
+
+def filter_docs_by_source(docs, src):
+    """Handles merged documents whose source is a merged string
+    (e.g. 'bc5cdr+ncbi_disease').
+    """
+    out = []
+    for d in docs:
+        ms = [m for m in d.mentions if src in m.source_datasets]
+        if ms:
+            out.append(DocumentExample(doc_id=d.doc_id, mentions=ms,
+                                       source=d.source, split=d.split))
+    return out
+
 
 
 
@@ -560,8 +636,6 @@ if __name__ == "__main__":
             with open(args.equivalences) as f:
                 equivalences = json.load(f)
 
-        docs = load_bioid_corpus(equivalences=equivalences)
-        _, _, test_docs = split_by_document(docs)
         docs = load_corpus(args.datasets, equivalences=equivalences,
                            merged_cache=args.corpus_cache)
         _, _, test_docs = make_splits(docs)
@@ -613,6 +687,17 @@ if __name__ == "__main__":
             all_results["Attention"] = model_df
             print("\n=== Attention Model ===")
             print(model_df.to_markdown(index=False))
+
+            print("\n=== Combined (all sources) ===")
+            print(comparison_table(test_docs, predictions).to_markdown(index=False))
+
+            print("\n=== Per source ===")
+            srcs = sorted({s for d in test_docs for m in d.mentions
+                           for s in m.source_datasets})
+            for src in srcs:
+                sub = filter_docs_by_source(test_docs, src)
+                print(f"\n[{src}]")
+                print(comparison_table(sub, predictions).to_markdown(index=False))
 
         # Comparison table
         if len(all_results) > 1 and args.mode == "compare":
