@@ -247,8 +247,7 @@ def load_bigbio_corpus(
 # === For single corpus building ===
 
 _BIGBIO_PARQUET_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir,
-    "data", "benchmark_mentions",
+    os.path.dirname(os.path.abspath(__file__)), "benchmark_mentions",
 )
 
 def load_corpus(
