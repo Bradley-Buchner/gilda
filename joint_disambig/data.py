@@ -11,8 +11,6 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
 
-import pandas as pd
-import pystow
 from tqdm import tqdm
 
 from gilda.grounder import Grounder, ScoredMatch
@@ -29,15 +27,10 @@ from bioid_evaluation import (
     URL,
 )
 
-_normalize_id = BioIDBenchmarker._normalize_id
-_normalize_ids = BioIDBenchmarker._normalize_ids
-_get_entity_type = BioIDBenchmarker._get_entity_type
-
-
 
 @dataclass
 class MentionExample:
-    """For a single mention's candidates and ground truth label
+    """For a single mention's candidates and ground truth label.
     """
     text: str
     entity_type: str
@@ -45,6 +38,8 @@ class MentionExample:
     gold_curies: set = field(default_factory=set)
     gold_synonyms: set = field(default_factory=set)
     gold_index: Optional[int] = None
+    offsets: Optional[list] = None
+    source_datasets: set = field(default_factory=set)
 
 
 @dataclass
@@ -53,8 +48,15 @@ class DocumentExample:
     """
     doc_id: str
     mentions: list = field(default_factory=list)
+    source: Optional[str] = None
+    split: Optional[str] = None
 
 
+_normalize_id = BioIDBenchmarker._normalize_id
+_normalize_ids = BioIDBenchmarker._normalize_ids
+_get_entity_type = BioIDBenchmarker._get_entity_type
+
+_mesh_chebi_crosswalk: Optional[dict] = None
 
 # for _get_benchmarker
 _benchmarker: Optional[BioIDBenchmarker] = None
