@@ -542,6 +542,8 @@ if __name__ == "__main__":
                         help="Min score for the top candidate "
                              "(if --ambiguous-only)")
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--datasets", nargs="+", default=["bioid"])
+    parser.add_argument("--corpus-cache", default=None)
     args = parser.parse_args()
 
     if args.mode == "feasibility":
@@ -550,7 +552,7 @@ if __name__ == "__main__":
 
     elif args.mode in ("evaluate", "compare"):
         import json
-        from .data import load_bioid_corpus, split_by_document
+        from .data import load_corpus, make_splits
         from .train import precompute_embeddings, predict_document, load_model
 
         equivalences = {}
@@ -560,6 +562,9 @@ if __name__ == "__main__":
 
         docs = load_bioid_corpus(equivalences=equivalences)
         _, _, test_docs = split_by_document(docs)
+        docs = load_corpus(args.datasets, equivalences=equivalences,
+                           merged_cache=args.corpus_cache)
+        _, _, test_docs = make_splits(docs)
 
         if args.ambiguous_only:
             test_docs = filter_ambiguous_mentions(
