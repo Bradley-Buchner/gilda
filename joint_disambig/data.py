@@ -191,6 +191,129 @@ def split_by_document(
 
 
 
+def _normalize_bigbio_curie(curie: str) -> list[str]:
+    """Convert a BigBio gold curie to Gilda convention. Simple string
+    formatting.
+    """
+    prefix, _, identifier = curie.partition(":")
+    identifier = identifier.strip()
+    if not identifier:
+        return []
+    if prefix == "MESH":
+        return [f"MESH:{identifier}"]  # MESH already native to Gilda
+    if prefix == "OMIM":
+        return [f"OMIM:{identifier}"]
+    if prefix == "NCBIGene":
+        return [f"NCBI gene:{identifier}"]
+    if prefix in ("CHEBI", "GO"):
+        return [_normalize_id(f"{prefix}:{identifier}")]
+    if prefix == "UMLS":
+        return []  # UMLS prefixes are handled in expand_gold_curies
+    return [curie]
+
+def build_mesh_chebi_crosswalk(cache_path=None) -> dict:
+    """Build a mapping from MeSH id to CHEBI curies by inverting
+    bio_ontology's CHEBI to MeSH xrefs. Build once and cache.
+    """
+    if cache_path and os.path.exists(cache_path):
+        with open(cache_path) as f:
+            return {k: set(v) for k, v in json.load(f).items()}
+    from indra.ontology.bio import bio_ontology
+    bio_ontology.initialize()
+    inverse = defaultdict(set)
+    for node in bio_ontology.nodes:
+        if not node.startswith("CHEBI:"):
+            continue
+        ns, _, rid = node.partition(":")
+        for prefix, ident in bio_ontology.get_mappings(ns, rid):
+            if prefix == "MESH":
+                inverse[ident].add(f"CHEBI:{rid}")
+    out = {k: sorted(v) for k, v in inverse.items()}
+    if cache_path:
+        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+        with open(cache_path, "w") as f:
+            json.dump(out, f)
+
+    return {k: set(v) for k, v in out.items()}
+
+def _get_mesh_chebi_crosswalk() -> dict:
+    global _mesh_chebi_crosswalk
+    if _mesh_chebi_crosswalk is None:
+        _mesh_chebi_crosswalk = build_mesh_chebi_crosswalk(
+            cache_path=os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "mesh_chebi_crosswalk.json"))
+    return _mesh_chebi_crosswalk
+
+
+# Dict to specify allowed namespaces and handle the MSH->MESH translation
+_UMLS_SAB_MAP = {"MSH": "MESH", "HGNC": "HGNC", "OMIM": "OMIM", "GO": "GO"}
+
+def build_umls_crosswalk(mrconso_path, cache_path=None, langs=("ENG",)):
+    """Build a mapping from CUI ids to Gilda-formatted xref curies from the UMLS Metathesaurus.
+    MRCONSO.RRF is read to build the mapping once, then it's cached.
+    """
+    if cache_path and os.path.exists(cache_path):
+        with open(cache_path) as f:
+            return {k: set(v) for k, v in json.load(f).items()}
+    crosswalk = defaultdict(set)
+    with open(mrconso_path, encoding="utf-8") as f:
+        for line in f:
+            p = line.rstrip("\n").split("|")
+            cui, lat, sab, code = p[0], p[1], p[11], p[13]
+            if langs and lat not in langs:
+                continue
+            ns = _UMLS_SAB_MAP.get(sab)
+            if not ns:
+                continue
+            bare = code.split(":")[-1]
+            seeds = {"MESH": f"MESH:{bare}", "HGNC": f"HGNC:{bare}",
+                    "GO": f"GO:GO:{bare}", "OMIM": f"OMIM:{bare}"}
+            seed = seeds[ns]
+            crosswalk[cui].add(seed)
+    crosswalk = {k: sorted(v) for k, v in crosswalk.items()}
+    if cache_path:
+        with open(cache_path, "w") as f:
+            json.dump(crosswalk, f)
+        print(f"UMLS crosswalk: {len(crosswalk)} CUIs -> {cache_path}")
+    return {k: set(v) for k, v in crosswalk.items()}
+
+
+def expand_gold_curies(db_ids, benchmarker=None, umls_crosswalk=None) -> set[str]:
+    """Expand a BigBio mention's gold db ids into synonyms using the
+    BioIDBenchmarker's get_synonym_set method.
+
+    Params:
+    -------
+    db_ids: list[str]
+        list of string db ids
+    benchmarker:
+        BioIDBenchmarker (created lazily)
+    umls_crosswalk: dict[str, set[str]]
+        Dict with CUI keys and sets of Gilda-formatted curies as values
+
+    Returns:
+    --------
+    Set of curies formatted in the Gilda convention
+    """
+    if benchmarker is None:
+        benchmarker = _get_benchmarker()
+    mesh_chebi = _get_mesh_chebi_crosswalk()
+    seeds = []
+    for curie in db_ids:
+        if curie.startswith("UMLS:") and umls_crosswalk is not None:
+            seeds.extend(umls_crosswalk.get(curie.split(":", 1)[1], ()))
+        else:
+            seeds.extend(_normalize_bigbio_curie(curie))
+    # Bridge any MeSH seed to CHEBI
+    for s in list(seeds):
+        if s.startswith("MESH:"):
+            seeds.extend(mesh_chebi.get(s.split(":", 1)[1], ()))
+    if not seeds:
+        return set()
+    return benchmarker.get_synonym_set(seeds)
+
+
 def report_statistics(examples: list[DocumentExample]) -> dict:
     """Print and return summary statistics on the corpus
     """
