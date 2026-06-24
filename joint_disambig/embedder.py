@@ -17,7 +17,7 @@ NAMESPACE_LABELS = {
     "MESH": "biomedical concept", "DOID": "disease", "HP": "phenotype",
     "EFO": "experimental factor", "CL": "cell type", "BTO": "tissue",
     "NCIT": "NCI concept", "TAXONOMY": "organism", "IP": "InterPro domain",
-    "PF": "Pfam domain",
+    "PF": "Pfam domain", "MONDO": "disease"
 }
 
 # Common taxonomy IDs to species names
@@ -104,11 +104,12 @@ def _build_embedding_text(term, grounder=None) -> str:
     --------
     str : rich text string to be embedded
     """
+    name = term.entry_name or term.text or term.id
     if grounder is None:
-        return term.entry_name
+        return name
 
     lookup = _get_description_lookup(grounder)
-    parts = [term.entry_name]
+    parts = [name]
 
     # Add descriptive name if available
     desc = lookup.get_description(term)
