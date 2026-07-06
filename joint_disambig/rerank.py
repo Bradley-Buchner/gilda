@@ -76,8 +76,13 @@ class JointReranker(object):
             self._embed([c.term for c in cands])
 
             # 2. Build lists
+            use_feats = getattr(self.model, "wants_candidate_features", False)
             for c in cands:
-                embs.append(self.cache[(c.term.db, c.term.id)])  # embedding from cache
+                emb = self.cache[(c.term.db, c.term.id)]  # embedding from cache
+                if use_feats:  # append Gilda score ingredients
+                    emb = np.concatenate(
+                        [emb, np.asarray(match_feature_vector(c), dtype=emb.dtype)])
+                embs.append(emb)
                 scores.append(c.score)  # Gilda score
                 m_ids.append(m_id)  # unique id
 
