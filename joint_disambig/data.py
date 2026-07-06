@@ -123,7 +123,7 @@ def load_bioid_corpus(
     df["entity_type"] = df.apply(
         lambda row: _classify_entity_type(row.obj, row.obj_synonyms), axis=1,
     )
-    df = df[df["entity_type"] != "unknown"]
+    df = df[df["entity_type"] != "other"]
 
     print("Generating Gilda candidates per document...")
     documents = []
@@ -169,12 +169,12 @@ def load_bigbio_corpus(
         cache_path: Optional[str] = None,
         exclude_types=("CompositeMention",),
         umls_crosswalk: Optional[dict] = None,
-        drop_unknown: bool = False,
+        drop_other: bool = False,
 ) -> list[DocumentExample]:
     """Load one BigBio dataset from its flattened parquet mention table into a
     DocumentExample list like load_bioid_corpus.
 
-    drop_unknown: if True, skip mentions classified as "unknown" (e.g. MedMentions
+    drop_other: if True, skip mentions classified as "other" (e.g. MedMentions
     TUIs outside _UMLS_TUI_GROUP). Default is False.
     """
     import pickle
@@ -211,8 +211,8 @@ def load_bigbio_corpus(
                                                umls_crosswalk=umls_crosswalk)
             entity_type = classify_entity_type_bigbio(
                 dataset_name, type_list, gold_synonyms)
-            if drop_unknown and entity_type == "unknown":
-                continue                         # skip ungroundable concept types
+            if drop_other and entity_type == "other":
+                continue  # skip out-of-scope concept types
 
             text = row["text"]
             offsets = [tuple(o) for o in row["offsets"]]
@@ -621,7 +621,7 @@ def _classify_entity_type(obj: list[str], obj_synonyms: set[str]) -> str:
         if any(s.startswith("HGNC") for s in obj_synonyms):
             return "Human Gene"
         return "Nonhuman Gene"
-    return etype
+    return "other" if etype == "unknown" else etype
 
 
 # Map each BigBio dataset's entity types to names that match those used by
@@ -674,7 +674,7 @@ def classify_entity_type_bigbio(dataset: str, type_list, gold_synonyms) -> str:
                             if any(s.startswith("HGNC") for s in gold_synonyms)
                             else "Nonhuman Gene")
                 return label
-        return "unknown"
+        return "other"
 
     mapping = _BIGBIO_TYPE_MAP.get(dataset, {})
 
@@ -685,7 +685,7 @@ def classify_entity_type_bigbio(dataset: str, type_list, gold_synonyms) -> str:
             label = mapping[t]
             break
     if label is None:
-        label = "unknown"
+        label = "other"
 
     # Mirror _classify_entity_type's splitting of human and non-human genes
     if label == "Gene":
