@@ -9,7 +9,10 @@ import torch
 
 from .data import DocumentExample
 from .embedder import CandidateEmbedder, _build_embedding_text
-from .model import JointDisambiguator, GatedJointDisambiguator, compute_loss
+from .model import (JointDisambiguator, GatedJointDisambiguator,
+                    GatedGildaBiasDisambiguator, GatedGateOnlyDisambiguator,
+                    GatedGFeatDisambiguator, GatedGFeatStatusExactBiasDisambiguator,
+                    GatedGFeatStatusExactCtxDisambiguator, compute_loss)
 from .rerank import JointReranker
 from gilda import Grounder
 
@@ -53,6 +56,47 @@ def precompute_embeddings(
     return cache
 
 
+def precompute_context_embeddings(
+    docs: list[DocumentExample],
+    embedder: CandidateEmbedder,
+    cache_path: Optional[str] = None,
+    max_length: int = 512,
+) -> dict[str, np.ndarray]:
+    """Embed one context string per document. Used by models that have
+    wants_context=True.
+    """
+    if cache_path and os.path.exists(cache_path):
+        with open(cache_path, "rb") as f:
+            cache = pickle.load(f)
+        print(f"Loaded {len(cache)} cached context embeddings from {cache_path}")
+        return cache
+
+    ids, strings = [], []
+    for doc in docs:
+        seen = list(dict.fromkeys(m.text for m in doc.mentions))
+        ids.append(doc.doc_id)
+        strings.append(", ".join(seen))
+    print(f"Embedding {len(strings)} document-context strings...")
+    vectors = embedder.embed_texts(strings, batch_size=32, max_length=max_length)
+    cache = {doc_id: vectors[i] for i, doc_id in enumerate(ids)}
+
+    if cache_path:
+        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+        with open(cache_path, "wb") as f:
+            pickle.dump(cache, f)
+        print(f"Saved context cache to {cache_path}")
+    return cache
+
+
+def _context_tensor(context_cache, doc_id, device):
+    """Look up a doc's context vector and tensorize it.
+    """
+    if not context_cache:
+        return None
+    v = context_cache.get(doc_id)
+    return torch.tensor(v, dtype=torch.float32, device=device) if v is not None else None
+
+
 def train(
     train_docs: list[DocumentExample],
     val_docs: list[DocumentExample],
@@ -65,11 +109,12 @@ def train(
     patience: int = 5,
     device: str = "cpu",
     cross_mention_only: bool = False,
-    temperature: float = 1.0
+    temperature: float = 1.0,
+    context_cache: Optional[dict] = None,
 ) -> JointDisambiguator:
     """Train a model with early stopping on validation loss and return the
-    best model checkpoint. Handles both JointDisambiguator and
-    GatedJointDisambiguator.
+    best model checkpoint. 'context_cache' feeds the document-context token
+    for models with wants_context=True and is ignored otherwise.
     """
     device = torch.device(device)
     jr = JointReranker(model, grounder, device=device, cache=embedding_cache)
@@ -93,8 +138,10 @@ def train(
                 [m.gold_index if m.gold_index is not None else -1
                  for m in doc.mentions if m.candidates],
                 dtype=torch.long, device=device)
+            ctx = _context_tensor(context_cache, doc.doc_id, device)
             scores = jr.model(embs, gs, mids, gate_feats,
-                              cross_mention_only=cross_mention_only)
+                              cross_mention_only=cross_mention_only,
+                              context_emb=ctx)
             loss = compute_loss(scores, mids, golds)
             if loss.item() == 0.0:
                 continue
@@ -119,8 +166,10 @@ def train(
                      for m in doc.mentions if m.candidates],
                     dtype=torch.long, device=device
                 )
+                ctx = _context_tensor(context_cache, doc.doc_id, device)
                 scores = jr.model(embs, gs, mids, gate_feats,
-                                  cross_mention_only=cross_mention_only)
+                                  cross_mention_only=cross_mention_only,
+                                  context_emb=ctx)
                 loss = compute_loss(scores, mids, golds)
                 val_loss += loss.item()
                 n_val += 1
@@ -164,14 +213,19 @@ def predict_document(
         doc: DocumentExample,
         embedding_cache: dict,
         model: JointDisambiguator,
-        device: str = "cpu"
+        device: str = "cpu",
+        context_cache: Optional[dict] = None,
 ) -> dict[str, list]:
     """Run inference on a single document and return {mention_text: re-ranked
-    ScoredMatch list}.
+    ScoredMatch list}. 'context_cache' feeds the document-context token
+    for models with wants_context=True and is ignored otherwise.
     """
     jr = _get_reranker(model, embedding_cache, device)
     with_cands = [m for m in doc.mentions if m.candidates]
-    ranked = jr.rerank([m.candidates for m in with_cands]) if with_cands else []
+    ctx = _context_tensor(context_cache, doc.doc_id, device) \
+        if getattr(model, "wants_context", False) else None
+    ranked = jr.rerank([m.candidates for m in with_cands],
+                       context_emb=ctx) if with_cands else []
     results = {m.text: r for m, r in zip(with_cands, ranked)}
     for m in doc.mentions:
         results.setdefault(m.text, m.candidates)
@@ -189,9 +243,13 @@ def save_model(model: JointDisambiguator, path: str,
         "state_dict": model.state_dict(),
         "model_type": model_type,
         "config": {
-            "embed_dim": model.input_proj.in_features - 1,
+            "embed_dim": getattr(model, "embed_dim", model.input_proj.in_features - 1),
             "hidden_dim": model.input_proj.out_features,
             "n_heads": model.attention.num_heads,
+            **({"n_cand_features": model.n_cand_features}
+               if hasattr(model, "n_cand_features") else {}),
+            **({"context_dim": model.context_dim}
+               if hasattr(model, "context_dim") else {}),
         },
         "embedding_mode": embedding_mode,
     }, path)
@@ -202,7 +260,17 @@ def load_model(path: str, device: str = "cpu") -> JointDisambiguator:
     """
     ckpt = torch.load(path, map_location=device, weights_only=True)
     model_type = ckpt.get("model_type", "JointDisambiguator")
-    if model_type == "GatedJointDisambiguator":
+    if model_type == "GatedGFeatStatusExactCtxDisambiguator":
+        model = GatedGFeatStatusExactCtxDisambiguator(**ckpt["config"])
+    elif model_type == "GatedGFeatStatusExactBiasDisambiguator":
+        model = GatedGFeatStatusExactBiasDisambiguator(**ckpt["config"])
+    elif model_type == "GatedGFeatDisambiguator":
+        model = GatedGFeatDisambiguator(**ckpt["config"])
+    elif model_type == "GatedGateOnlyDisambiguator":
+        model = GatedGateOnlyDisambiguator(**ckpt["config"])
+    elif model_type == "GatedGildaBiasDisambiguator":
+        model = GatedGildaBiasDisambiguator(**ckpt["config"])
+    elif model_type == "GatedJointDisambiguator":
         model = GatedJointDisambiguator(**ckpt["config"])
     else:
         model = JointDisambiguator(**ckpt["config"])
@@ -225,12 +293,17 @@ if __name__ == "__main__":
     parser.add_argument("--output", default="joint_disambig/model_checkpoint.pt")
     parser.add_argument("--embedding-cache",
                         default="joint_disambig/embedding_cache_rich.pkl")
+    parser.add_argument("--context-cache", default=None,
+                        help="path to/for the per-document context embedding "
+                             "cache (required for gated_gfeat_statusexactctx)")
     parser.add_argument("--equivalences", default=None,
                         help="Path to equivalences.json")
     parser.add_argument("--model-type",
-                        choices=["plain", "gated"], default="gated",
-                        help="Model variant: 'plain' for JointDisambiguator, "
-                             "'gated' for GatedJointDisambiguator")
+                        choices=["plain", "gated", "gated_gbias", "gated_gateonly",
+                                 "gated_gfeat", "gated_gfeat_statusexactbias",
+                                 "gated_gfeat_statusexactctx"],
+                        default="gated",
+                        help="Model variant")
     parser.add_argument("--temperature", type=float, default=1.0,
                         help="Temperature param for sharpening the logit"
                              "distribution")
@@ -263,15 +336,31 @@ if __name__ == "__main__":
     cache = precompute_embeddings(train_docs + val_docs + test_docs,
                                   embedder, args.embedding_cache)
 
-    if args.model_type == "gated":
+    if args.model_type == "gated_gfeat_statusexactctx":
+        model = GatedGFeatStatusExactCtxDisambiguator(embed_dim=embedder.embed_dim)
+    elif args.model_type == "gated_gfeat_statusexactbias":
+        model = GatedGFeatStatusExactBiasDisambiguator(embed_dim=embedder.embed_dim)
+    elif args.model_type == "gated_gfeat":
+        model = GatedGFeatDisambiguator(embed_dim=embedder.embed_dim)
+    elif args.model_type == "gated_gateonly":
+        model = GatedGateOnlyDisambiguator(embed_dim=embedder.embed_dim)
+    elif args.model_type == "gated_gbias":
+        model = GatedGildaBiasDisambiguator(embed_dim=embedder.embed_dim)
+    elif args.model_type == "gated":
         model = GatedJointDisambiguator(embed_dim=embedder.embed_dim)
     else:
         model = JointDisambiguator(embed_dim=embedder.embed_dim)
 
+    ctx_cache = None
+    if getattr(model, "wants_context", False):
+        ctx_cache = precompute_context_embeddings(
+            train_docs + val_docs + test_docs, embedder, args.context_cache)
+
     model = train(
         train_docs, val_docs, cache, model, grounder,
         epochs=args.epochs, lr=args.lr, patience=args.patience,
-        device=args.device, temperature=args.temperature
+        device=args.device, temperature=args.temperature,
+        context_cache=ctx_cache,
     )
     save_model(model, args.output, embedding_mode="rich")
     print(f"Model saved to {args.output}")
