@@ -4,6 +4,27 @@ from .embedder import CandidateEmbedder, _build_embedding_text
 from .model import GatedJointDisambiguator
 
 
+_STATUS_IDX = {"curated": 0, "name": 1, "synonym": 2, "former_name": 3}
+
+def match_feature_vector(c):
+    """Return a 10-d feature vector for a ScoredMatch with 4 dims dedicated for
+    status one-hot encoding and 6 dims for normalized string sub-scores from c.match.
+    """
+    m = c.match
+    status = [0.0, 0.0, 0.0, 0.0]
+    si = _STATUS_IDX.get(getattr(c.term, "status", None))
+    if si is not None:
+        status[si] = 1.0
+    return status + [
+        m.score_short_abbr() / 1.0,
+        m.score_mixed() / 2.0,
+        m.score_exact() / 1.0,
+        m.score_acic() / 2.0,
+        m.score_combo() / 6.0,
+        m.score_dash() / 2.0,
+    ]
+
+
 class JointReranker(object):
     """Jointly re-ranks ScoredMatch lists from multiple ground() calls.
     """
