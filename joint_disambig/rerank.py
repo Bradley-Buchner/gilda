@@ -103,9 +103,10 @@ class JointReranker(object):
 
         return embs_tensor, scores_tensor, m_ids_tensor, gate_feats_tensor
 
-    def rerank(self, candidate_lists):
+    def rerank(self, candidate_lists, context_emb=None):
         """Re-ranks a list[list[ScoredMatch]] object with a provided model. Returns another
-        list[list[ScoredMatch]] object.
+        list[list[ScoredMatch]] object. context_emb (a 1d document-context vector)
+        is passed to models that declare wants_context.
         """
         # Build the tensors the model needs from candidate_lists
         model_tensors = self.build_model_tensors(candidate_lists)
@@ -113,15 +114,17 @@ class JointReranker(object):
             return candidate_lists
 
         # Run model and unpack output
-        # self.model.eval()
-        # with torch.no_grad():
-        #     out = self.model(*model_tensors).cpu().numpy()
-
-        # Run model and unpack output
         embs, scores, m_ids, gate_feats = model_tensors
+        ctx = None
+        if context_emb is not None:
+            ctx = torch.as_tensor(context_emb, dtype=torch.float32,
+                                  device=self.device)
         self.model.eval()
         with torch.no_grad():
-            if isinstance(self.model, GatedJointDisambiguator):
+            if getattr(self.model, "wants_context", False):
+                out = self.model(embs, scores, m_ids, gate_feats,
+                                 context_emb=ctx).cpu().numpy()
+            elif isinstance(self.model, GatedJointDisambiguator):
                 out = self.model(embs, scores, m_ids, gate_feats).cpu().numpy()
             else:
                 out = self.model(embs, scores, m_ids).cpu().numpy()
