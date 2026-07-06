@@ -166,7 +166,8 @@ class CandidateEmbedder:
                 self._cache = pickle.load(f)
 
     @torch.no_grad()
-    def embed_texts(self, texts: list[str], batch_size: int = 32) -> np.ndarray:
+    def embed_texts(self, texts: list[str], batch_size: int = 32,
+                    max_length: int = 128) -> np.ndarray:
         """Embed a list of texts. Returns (N, hidden_dim) array via [CLS] pooling.
         """
         all_vecs = []
@@ -174,7 +175,7 @@ class CandidateEmbedder:
             batch = texts[i : i + batch_size]
             tok = self.tokenizer(
                 batch, padding=True, truncation=True,
-                max_length=128, return_tensors="pt",
+                max_length=max_length, return_tensors="pt",
             ).to(self.device)
             out = self.model(**tok)
             all_vecs.append(out.last_hidden_state[:, 0, :].cpu().numpy())
