@@ -1,4 +1,14 @@
 """Evaluation and feasibility check for joint disambiguation model results
+
+Usage for best current model...
+
+python -m joint_disambig.evaluate \
+  --mode evaluate \
+  --model-path joint_disambig/model_tier2_gfeat_statusexactctx.pt \
+  --datasets bioid bc5cdr nlmchem ncbi_disease gnormplus medmentions_st21pv \
+  --corpus-cache joint_disambig/corpus_cache/tier2_merged.pkl \
+  --embedding-cache joint_disambig/embedding_cache_tier2.pkl \
+  --context-cache joint_disambig/context_cache_tier2.pkl
 """
 import os
 import pickle
@@ -635,6 +645,9 @@ if __name__ == "__main__":
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--datasets", nargs="+", default=["bioid"])
     parser.add_argument("--corpus-cache", default=None)
+    parser.add_argument("--context-cache", default=None,
+                        help="per-document context embedding cache (for "
+                             "wants_context=True models)")
     args = parser.parse_args()
 
     if args.mode == "feasibility":
@@ -644,7 +657,8 @@ if __name__ == "__main__":
     elif args.mode in ("evaluate", "compare"):
         import json
         from .data import load_corpus, make_splits
-        from .train import precompute_embeddings, predict_document, load_model
+        from .train import (precompute_embeddings, precompute_context_embeddings,
+                            predict_document, load_model)
 
         equivalences = {}
         if args.equivalences:
@@ -692,10 +706,16 @@ if __name__ == "__main__":
                                           args.embedding_cache)
             model = load_model(args.model_path, device=args.device)
 
+            context_cache = None
+            if getattr(model, "wants_context", False):
+                context_cache = precompute_context_embeddings(
+                    test_docs, embedder, args.context_cache)
+
             predictions = {}
             for doc in test_docs:
                 predictions[doc.doc_id] = predict_document(
                     doc, cache, model, device=args.device,
+                    context_cache=context_cache,
                 )
 
             model_df = evaluate_predictions(test_docs, predictions)
