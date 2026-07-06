@@ -550,6 +550,9 @@ def comparison_table(docs, predictions):
             return float("inf") if gains else 0.0
         return round(gains / losses, 2)
 
+    def net_pct(net, total):
+        return round(100 * net / total, 1) if total else 0.0
+
     rows, tot = [], defaultdict(int)
     for et in sorted(agg):
         r = agg[et]
@@ -563,7 +566,13 @@ def comparison_table(docs, predictions):
             "Losses": r["losses"],
             "Net": r["gains"] - r["losses"],
             "G/L": gl_ratio(r["gains"], r["losses"]),
+            "Net %": net_pct(r["gains"] - r["losses"], r["total"]),
         })
+    # Macro (per-type) averages over the per-type rows
+    gl_finite = [row["G/L"] for row in rows if row["Losses"] > 0]
+    avg_gl = round(sum(gl_finite) / len(gl_finite), 2) if gl_finite else 0.0
+    avg_gf1 = round(sum(row["Gilda F1"] for row in rows) / len(rows), 3) if rows else 0
+    avg_af1 = round(sum(row["Attn F1"] for row in rows) / len(rows), 3) if rows else 0
     rows.append({
         "Entity Type": "Total", "Total": tot["total"],
         "Gilda F1": f1(tot["g_corr"], tot["g_has"], tot["total"]),
@@ -572,6 +581,12 @@ def comparison_table(docs, predictions):
         "Losses": tot["losses"],
         "Net": tot["gains"] - tot["losses"],
         "G/L": gl_ratio(tot["gains"], tot["losses"]),
+        "Net %": net_pct(tot["gains"] - tot["losses"], tot["total"]),
+    })
+    rows.append({
+        "Entity Type": "Average (per-type, excl inf)", "Total": "",
+        "Gilda F1": avg_gf1, "Attn F1": avg_af1,
+        "Gains": "", "Losses": "", "Net": "", "G/L": avg_gl, "Net %": "",
     })
     import pandas as pd
     return pd.DataFrame(rows)
