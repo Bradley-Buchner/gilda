@@ -693,6 +693,139 @@ def terms_from_obo_url(url, prefix, ignore_mappings=False, map_to_ns=None):
     return terms
 
 
+def generate_ncit_terms(version='26.06e', return_parents=False, roots=None):
+    """Generate terms from the NCI Thesaurus (NCIt) FLAT release file.
+
+    If `return_parents` is True, also return a dict mapping every NCIt code
+    to its set of parent codes for hierarchy-aware filtering with
+    filter_ncit_hierarchy.
+
+    If `roots` (and iterable of concept codes) is provided, only generate
+    terms for concepts within the subtrees rooted at those codes rather
+    than the whole NIC Thesaurus.
+    """
+    fname = os.path.join(resource_dir, 'ncit_thesaurus_%s.txt' % version)
+    if not os.path.exists(fname):
+        import io
+        import zipfile
+        url = ('https://evs.nci.nih.gov/ftp1/NCI_Thesaurus/'
+               'Thesaurus_%s.FLAT.zip' % version)
+        logger.info('Downloading NCIt FLAT resource file from %s', url)
+        content = requests.get(url).content
+        with zipfile.ZipFile(io.BytesIO(content)) as zf:
+            with open(fname, 'wb') as fh:
+                fh.write(zf.read('Thesaurus.txt'))
+
+    logger.info('Loading %s', fname)
+    # Skip retired/obsolete concepts and hierarchy-only header concepts
+    drop_status = {'Retired_Concept', 'Obsolete_Concept', 'Header_Concept'}
+    parents = {}
+    allowed = None
+    if roots is not None:
+        with open(fname, 'r', encoding='utf-8') as fh:
+            for row in csv.reader(fh, delimiter='\t', quoting=csv.QUOTE_NONE):
+                parents[row[0]] = set(row[2].split('|')) if row[2] else set()
+        allowed = ncit_subtree_codes(roots, parents)
+        logger.info('Restricting to %d concepts under %d NCIt root(s)',
+                    len(allowed), len(set(roots)))
+
+    terms = []
+    with open(fname, 'r', encoding='utf-8') as fh:
+        # NCIt definitions contain unescaped double quotes, so disable csv quoting
+        reader = csv.reader(fh, delimiter='\t', quoting=csv.QUOTE_NONE)
+        for row in reader:
+            code, parents_field, synonyms_field, status = \
+                row[0], row[2], row[3], row[6]
+            if allowed is not None and code not in allowed:
+                continue
+            # Record parents for all concepts so the hierarchy is complete
+            if return_parents and roots is None:
+                parents[code] = set(parents_field.split('|')) \
+                    if parents_field else set()
+            if status and (set(status.split('|')) & drop_status):
+                continue
+            synonyms = synonyms_field.split('|')
+            entry_name = synonyms[0]
+            seen = set()
+            for idx, synonym in enumerate(synonyms):
+                norm = normalize(synonym)
+                # Skip synonyms that normalize to nothing and duplicates for the same concept
+                if not norm.strip() or norm in seen:
+                    continue
+                seen.add(norm)
+                term_status = 'name' if idx == 0 else 'synonym'
+                terms.append(Term(norm, synonym, 'NCIT', code, entry_name,
+                                  term_status, 'ncit'))
+    logger.info('Loaded %d terms', len(terms))
+    return (terms, parents) if return_parents else terms
+
+
+def _ncit_ancestors(code, parents):
+    """Return the set of all parent codes (ancestors) of `code`.
+
+    `parents` is a dict mapping each code to its set of direct parents.
+    """
+    ancestors = set()
+    stack = list(parents.get(code, ()))  # start with code's direct parents
+    while stack:
+        parent = stack.pop()  # take parent off top of stack
+        if parent not in ancestors:
+            ancestors.add(parent)
+            stack.extend(parents.get(parent, ()))  # add parent's parents to the stack
+    return ancestors
+
+
+def ncit_subtree_codes(roots, parents):
+    """Get all NCIt codes in the subtrees rooted at `roots`, which is
+    and iterable of NCIt codes to use as subtree roots.
+
+    `parents` is a dict mapping each code to its set of direct parents.
+
+    Returns a set of codes including the roots and their descendents.
+    """
+    children = {}  # invert `parents` map to a `children` map
+    for code, code_parents in parents.items():
+        for parent in code_parents:
+            children.setdefault(parent, set()).add(code)
+    subtree = set()
+    stack = list(roots)  # start stack with the roots
+    while stack:
+        code = stack.pop()  # take one off the top
+        if code not in subtree:
+            subtree.add(code)
+            stack.extend(children.get(code, ()))  # add children's children to the stack
+    return subtree
+
+
+def filter_ncit_hierarchy(scored_matches, parents):
+    """Drop NCIt matches that are an ancestor/descendant of a higher-scored one.
+
+    E.g., since "Childhood Glioblastoma" is a descendent of "Glioblastoma", if
+    Gilda returns both as matches, the lower-scoring one is dropped.
+
+    Parameters
+    ----------
+    scored_matches : list[gilda.grounder.ScoredMatch]
+        Output of Grounder.ground for an NCIt grounder.
+    parents : dict[str, set[str]]
+        NCIt code -> set of parent codes, from
+        ``generate_ncit_terms(return_parents=True)``.
+
+    Returns a list[gilda.grounder.ScoredMatch]: the filtered matches,
+    in decreasing order of score.
+    """
+    ancestors = {m.term.id: _ncit_ancestors(m.term.id, parents)
+                 for m in scored_matches}  # get each match's ancestors
+    kept = []
+    for match in sorted(scored_matches, key=lambda m: m.score, reverse=True):
+        code = match.term.id
+        related = any(k.term.id in ancestors[code] or code in ancestors[k.term.id]
+                      for k in kept)
+        if not related:
+            kept.append(match)  # keep only the top-scoring match of the same lineage
+    return kept
+
+
 def get_all_terms():
     terms = []
 
