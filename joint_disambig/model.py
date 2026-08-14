@@ -1,8 +1,12 @@
 """Self-attention model for joint candidate scoring."""
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+BIAS_COLS = [0, 1, 2, 3, 6]
 
 
 class TransformerBlock(nn.Module):
@@ -27,377 +31,119 @@ class TransformerBlock(nn.Module):
 
 
 class JointDisambiguator(nn.Module):
-    """Disambiguates a mention's Gilda candidates by attending to the Gilda
-    candidates of other mentions from the same source (document, experimental
-    dataset, etc.). Each candidate is represented as a numerical vector of
-    [LLM_embedding; gilda_score], which is projected into a lower-dimensional
-    latent space, then passed through self-attention to let candidates from
-    different mentions talk to each other as they are updated. A linear head
-    then produces a scalar score per candidate, which is merged with the
-    original Gilda score to produce the final grounding score.
+    """Disambiguates a mention's Gilda candidates by attending to the Gilda candidates
+    of other mentions from the same source (document, experimental dataset, etc.). Each
+    candidate is represented as a numerical vector of [LLM_embedding; gilda_score], which
+    is projected into a lower-dimensional latent space, then passed through a stack of
+    Transformer blocks to let candidates from different mentions inform each other as
+    they're updated. A linear head then produces a scalar score per candidate, and
+    sorting each mention's candidates by that score gives the re-ranked list.
 
      Params:
      -------
      embed_dim :
-        Dimensionality of LLM embeddings (768 for PubMedBERT)
+        Dimensionality of LLM embeddings (keep at 768 for PubMedBERT)
      hidden_dim :
         Dimensionality of hidden layers
      n_heads :
         Number of attention heads
      dropout :
         Dropout rate for training
+    n_cand_features :
+        Number of lexical features used from Gilda for a candidate (6 sub-scores that
+        go into  the Gilda score calculation, and 4 one-hot flags for string match
+        status)
+    context_dim :
+        Dimensionality of the CTX token's embedding (also keep at 768 for PubMedBERT)
+    num_layers :
+        Number of TransformerBlock blocks layered on top of each other
+    feature_skip :
+        If True, re-attach (concatenate) the n_cand_features lexical features to the
+        updated vector representations produced by the num_layers TransformerBlock
+        blocks.
     """
-    def __init__(
-        self,
-        embed_dim: int = 768,
-        hidden_dim: int = 128,
-        n_heads: int = 4,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-        self.input_proj = nn.Linear(embed_dim + 1, hidden_dim)
-        self.attention = nn.MultiheadAttention(
-            hidden_dim, n_heads, dropout=dropout, batch_first=True,
-        )
-        self.score_head = nn.Linear(hidden_dim, 1)
-        self.dropout = nn.Dropout(dropout)
 
-    def forward(
-        self,
-        embeddings: torch.Tensor,
-        gilda_scores: torch.Tensor,
-        mention_ids: torch.Tensor,
-        cross_mention_only: bool = False,
-    ) -> torch.Tensor:
-        """Score all candidates jointly.
-
-        Params:
-        -------
-        embeddings : (N, embed_dim)
-            LLM embeddings for N candidates.
-        gilda_scores : (N, 1)
-            Gilda's lexical scores for N candidates.
-        mention_ids : (N,)
-            Integer ID for each candidate indicating its mention group. Used
-            to group candidates for computing the loss.
-        cross_mention_only : bool
-            If True, use an attention mask to block attention between candidates
-            for the same mention. Simple change to the attention pattern.
-
-        Returns:
-        --------
-        scores : (N,)
-        """
-        x = torch.cat([embeddings, gilda_scores], dim=-1)
-        x = F.relu(self.input_proj(x))
-        x = self.dropout(x)
-
-        # Build an attention mask if cross-mention only
-        attn_mask = None
-        if cross_mention_only:
-            # Block within-mention attn but allow self-attn
-            N = mention_ids.shape[0]
-            same_mention = mention_ids.unsqueeze(0) == mention_ids.unsqueeze(1)
-            diag = torch.eye(N, dtype=torch.bool, device=mention_ids.device)
-            attn_mask = same_mention & ~diag  # i.e., block siblings, allow self
-
-        x = x.unsqueeze(0)
-        x, _ = self.attention(x, x, x, attn_mask=attn_mask)
-        x = x.squeeze(0)
-        return self.score_head(x).squeeze(-1)
-
-
-class GatedJointDisambiguator(nn.Module):
-    """JointDisambiguator with a learned confidence gate. The gate looks at
-    three statistics per mention––the number of candidates, the score gap
-    between the top 2 candidates, and the score of the top candidate––and
-    outputs a blending weight between 0 and 1, where 0 means defer to the
-    original Gilda scores/ranking and 1 means trust the new model-learned
-    scores.
-
-    Concretely, Final score = gate * attention_score + (1 - gate) * gilda_score.
-
-    The gate is per-mention, meaning all candidates of a mention share the
-    same gate value. This forces the gate to dynamically determine when to
-    trust the new model-learned scores.
-    """
-    def __init__(
-        self,
-        embed_dim: int = 768,
-        hidden_dim: int = 128,
-        n_heads: int = 4,
-        dropout: float = 0.1,
-        n_gate_features: int = 3,
-    ):
-        super().__init__()
-        # Has the same attention architecture as JointDisambiguator
-        self.input_proj = nn.Linear(embed_dim + 1, hidden_dim)
-        self.attention = nn.MultiheadAttention(
-            hidden_dim, n_heads, dropout=dropout, batch_first=True,
-        )
-        self.score_head = nn.Linear(hidden_dim, 1)
-        self.dropout = nn.Dropout(dropout)
-
-        # MLP for the gate: maps per-mention features to a scalar in [0, 1]
-        self.gate = nn.Sequential(
-            nn.Linear(n_gate_features, 16),
-            nn.ReLU(),
-            nn.Linear(16, 1),
-            nn.Sigmoid(),
-        )
-
-    def forward(
-        self,
-        embeddings: torch.Tensor,
-        gilda_scores: torch.Tensor,
-        mention_ids: torch.Tensor,
-        gate_features: torch.Tensor,
-        cross_mention_only: bool = False,
-    ) -> torch.Tensor:
-        """Score all candidates jointly with a learned confidence gate.
-
-        Params:
-        -------
-        embeddings : (N, embed_dim)
-            LLM embeddings for N candidates.
-        gilda_scores : (N, 1)
-            Gilda's lexical scores for N candidates.
-        mention_ids : (N,)
-            Integer ID for each candidate indicating its mention group. Used
-            to group candidates for computing the loss.
-        gate_features : (M, n_gate_features)
-            Per-mention features ([score_gap, n_candidates, top_score])
-        cross_mention_only : bool
-            If True, use an attention mask to block attention between candidates
-            for the same mention. Simple change to the attention pattern.
-
-        Returns:
-        --------
-        scores : (N,)
-        """
-        # Same as JointDisambiguator
-        x = torch.cat([embeddings, gilda_scores], dim=-1)
-        x = F.relu(self.input_proj(x))
-        x = self.dropout(x)
-
-        attn_mask = None
-        if cross_mention_only:
-            N = mention_ids.shape[0]
-            same_mention = mention_ids.unsqueeze(0) == mention_ids.unsqueeze(1)
-            diag = torch.eye(N, dtype=torch.bool, device=mention_ids.device)
-            attn_mask = same_mention & ~diag
-
-        x = x.unsqueeze(0)
-        x, _ = self.attention(x, x, x, attn_mask=attn_mask)
-        x = x.squeeze(0)
-        attn_scores = self.score_head(x).squeeze(-1)  # (N,)
-
-        # New per-mention gate: broadcast (M, 1) to (N,)
-        gate_values = self.gate(gate_features).squeeze(-1)  # (M,)
-        per_candidate_gate = gate_values[mention_ids]  # (N,)
-
-        # Blend model scores with original gilda scores
-        return per_candidate_gate * attn_scores + (1 - per_candidate_gate) * gilda_scores.squeeze(-1)
-
-
-class GatedGildaBiasDisambiguator(GatedJointDisambiguator):
-    """GatedJointDisambiguator plus a learnable Gilda-score-derived attention bias.
-    """
-    def __init__(self,
-                 embed_dim: int = 768,
-                 hidden_dim: int = 128,
-                 n_heads: int = 4,
-                 dropout: float = 0.1,
-                 n_gate_features: int = 3
-                 ):
-        super().__init__(embed_dim, hidden_dim, n_heads, dropout, n_gate_features)
-        self.gilda_attn_bias = nn.Linear(1, 1)  # scalar gilda score -> scalar bias
-
-    def forward(self, embeddings, gilda_scores, mention_ids,
-                gate_features, cross_mention_only=False):
-        x = torch.cat([embeddings, gilda_scores], dim=-1)
-        x = F.relu(self.input_proj(x))
-        x = self.dropout(x)
-
-        N = mention_ids.shape[0]
-        key_bias = self.gilda_attn_bias(gilda_scores).squeeze(-1)
-        attn_mask = key_bias.unsqueeze(0).expand(N, N).clone()
-
-        if cross_mention_only:
-            same_mention = mention_ids.unsqueeze(0) == mention_ids.unsqueeze(1)
-            diag = torch.eye(N, dtype=torch.bool, device=mention_ids.device)
-            attn_mask = attn_mask.masked_fill(same_mention & ~diag, float("-inf"))
-
-        x = x.unsqueeze(0)
-        x, _ = self.attention(x, x, x, attn_mask=attn_mask)
-        x = x.squeeze(0)
-        attn_scores = self.score_head(x).squeeze(-1)
-
-        gate_values = self.gate(gate_features).squeeze(-1)
-        per_candidate_gate = gate_values[mention_ids]
-        return per_candidate_gate * attn_scores + (1 - per_candidate_gate) * gilda_scores.squeeze(-1)
-
-
-class GatedGateOnlyDisambiguator(GatedJointDisambiguator):
-    """Ablation that tests removing the Gilda score from the candidate feature
-    vector and only using it for the confidence gate.
-    """
-    def __init__(self,
-                 embed_dim: int = 768,
-                 hidden_dim: int = 128,
-                 n_heads: int = 4,
-                 dropout: float = 0.1,
-                 n_gate_features: int = 3
-                 ):
-        super().__init__(embed_dim, hidden_dim, n_heads, dropout, n_gate_features)
-        self.embed_dim = embed_dim
-        self.input_proj = nn.Linear(embed_dim, hidden_dim)
-
-    def forward(self, embeddings, gilda_scores, mention_ids,
-                gate_features, cross_mention_only=False):
-        x = F.relu(self.input_proj(embeddings))
-        x = self.dropout(x)
-
-        attn_mask = None
-        if cross_mention_only:
-            N = mention_ids.shape[0]
-            same_mention = mention_ids.unsqueeze(0) == mention_ids.unsqueeze(1)
-            diag = torch.eye(N, dtype=torch.bool, device=mention_ids.device)
-            attn_mask = same_mention & ~diag
-
-        x = x.unsqueeze(0)
-        x, _ = self.attention(x, x, x, attn_mask=attn_mask)
-        x = x.squeeze(0)
-        attn_scores = self.score_head(x).squeeze(-1)
-
-        gate_values = self.gate(gate_features).squeeze(-1)
-        per_candidate_gate = gate_values[mention_ids]
-        return per_candidate_gate * attn_scores + (1 - per_candidate_gate) * gilda_scores.squeeze(-1)
-
-
-class GatedGFeatDisambiguator(GatedGateOnlyDisambiguator):
-    """Concatenate the match properties of each candidate onto its feature vector
-    instead of its gilda score.
-    """
+    wants_context = True
     wants_candidate_features = True
 
-    def __init__(self,
-                 embed_dim: int = 768,
-                 hidden_dim: int = 128,
-                 n_heads: int = 4,
-                 dropout: float = 0.1,
-                 n_gate_features: int = 3,
-                 n_cand_features: int = 10
-                 ):
-        super().__init__(embed_dim, hidden_dim, n_heads, dropout, n_gate_features)
+    def __init__(
+        self,
+        embed_dim: int = 768,
+        hidden_dim: int = 128,
+        n_heads: int = 4,
+        dropout: float = 0.1,
+        n_cand_features=10,
+        context_dim=768,
+        num_layers=3,
+        feature_skip=True,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
         self.n_cand_features = n_cand_features
-        self.input_proj = nn.Linear(embed_dim + n_cand_features, hidden_dim)
-
-class _GFeatKeyBiasBase(GatedGFeatDisambiguator):
-    """Base class for GatedGFeatDisambiguator that sets two args:
-      _bias_cols: feature vector column indices feeding the bias (None = all 10)
-      _per_head : if True, instantiates separate biases per attention head
-                    (Linear -> n_heads), else uses one shared bias (Linear -> 1).
-    """
-    _bias_cols = None
-    _per_head = False
-
-    def __init__(self,
-                 embed_dim: int = 768,
-                 hidden_dim: int = 128,
-                 n_heads: int = 4,
-                 dropout: float = 0.1,
-                 n_gate_features: int = 3,
-                 n_cand_features: int = 10
-                 ):
-        super().__init__(embed_dim, hidden_dim, n_heads, dropout, n_gate_features,
-                         n_cand_features)
-        in_dim = n_cand_features if self._bias_cols is None else len(self._bias_cols)
-        self.feat_attn_bias = nn.Linear(in_dim, n_heads if self._per_head else 1)
-
-    def forward(self, embeddings, gilda_scores, mention_ids,
-                gate_features, cross_mention_only=False):
-        feats = embeddings[:, self.embed_dim:]
-        feats_b = feats if self._bias_cols is None else feats[:, self._bias_cols]
-        x = F.relu(self.input_proj(embeddings))
-        x = self.dropout(x)
-
-        N = mention_ids.shape[0]
-        bias = self.feat_attn_bias(feats_b)
-        if self._per_head:
-            H = self.attention.num_heads
-            attn_mask = bias.t().unsqueeze(1).expand(H, N, N).clone()
-        else:
-            attn_mask = bias.squeeze(-1).unsqueeze(0).expand(N, N).clone()
-
-        if cross_mention_only:
-            same = mention_ids.unsqueeze(0) == mention_ids.unsqueeze(1)
-            block = same & ~torch.eye(N, dtype=torch.bool, device=mention_ids.device)
-            block = block.unsqueeze(0) if self._per_head else block
-            attn_mask = attn_mask.masked_fill(block, float("-inf"))
-
-        x = x.unsqueeze(0)
-        x, _ = self.attention(x, x, x, attn_mask=attn_mask)
-        x = x.squeeze(0)
-        attn_scores = self.score_head(x).squeeze(-1)
-        gate_values = self.gate(gate_features).squeeze(-1)
-        per_candidate_gate = gate_values[mention_ids]
-        return per_candidate_gate * attn_scores + (1 - per_candidate_gate) * gilda_scores.squeeze(-1)
-
-
-
-class GatedGFeatStatusExactBiasDisambiguator(_GFeatKeyBiasBase):
-    """GatedGFeatDisambiguator plus a single bias from the 'status' and 'exact' cols.
-    """
-    _bias_cols = [0, 1, 2, 3, 6]
-    _per_head = False
-
-
-class GatedGFeatStatusExactCtxDisambiguator(GatedGFeatStatusExactBiasDisambiguator):
-    """GatedGFeatDisambiguator plus one unscored document-level context token per
-    document. The context (CTX) token in the frozen PubMedBERT [CLS] embedding
-    of a comma-separated string of all of a document's surface mentions.
-    """
-    wants_context = True
-
-    def __init__(self,
-                 embed_dim=768,
-                 hidden_dim=128,
-                 n_heads=4,
-                 dropout=0.1,
-                 n_gate_features=3,
-                 n_cand_features=10,
-                 context_dim=768
-                 ):
-        super().__init__(embed_dim, hidden_dim, n_heads, dropout,
-                         n_gate_features, n_cand_features)
         self.context_dim = context_dim
+        self.num_layers = num_layers
+        self.feature_skip = feature_skip
+        self.dropout = nn.Dropout(dropout)
+        self.input_proj = nn.Linear(embed_dim + n_cand_features, hidden_dim)
+        self.feat_attn_bias = nn.Linear(len(BIAS_COLS), 1)
         self.ctx_proj = nn.Linear(context_dim, hidden_dim)
 
-    def forward(self, embeddings, gilda_scores, mention_ids, gate_features,
-                cross_mention_only=False, context_emb=None):
-        feats_b = embeddings[:, self.embed_dim:][:, self._bias_cols]
+        self.blocks = nn.ModuleList([
+            TransformerBlock(hidden_dim, n_heads, dropout)
+            for _ in range(num_layers)])
+        self.score_head = nn.Linear(
+            hidden_dim + (n_cand_features if feature_skip else 0), 1)
+
+    def _trunk(self, embeddings, context_emb, mention_ids=None):
+        """Handles the sending of the CTX and candidate embeddings through
+        TransformerBlock blocks. Returns updated candidate representations and
+        the updated CTX representation when applicable.
+        """
+        N = embeddings.shape[0]
+        feats_b = embeddings[:, self.embed_dim:][:, BIAS_COLS]
         x = self.dropout(F.relu(self.input_proj(embeddings)))
-        N = mention_ids.shape[0]
         key_bias = self.feat_attn_bias(feats_b).squeeze(-1)
+        cross_block = (mention_ids.unsqueeze(0) != mention_ids.unsqueeze(1)
+                       if mention_ids is not None else None)
 
-        if context_emb is not None:
-            ctx = F.relu(self.ctx_proj(context_emb.view(1, -1)))
-            seq = torch.cat([ctx, x], dim=0).unsqueeze(0)
-            full_bias = torch.cat(
-                [torch.zeros(1, device=key_bias.device), key_bias])
-            attn_mask = full_bias.unsqueeze(0).expand(1 + N, 1 + N).clone()
-            out, _ = self.attention(seq, seq, seq, attn_mask=attn_mask)
-            x = out.squeeze(0)[1:]
-        else:
+        if context_emb is None:
             attn_mask = key_bias.unsqueeze(0).expand(N, N).clone()
-            xo = x.unsqueeze(0)
-            x = self.attention(xo, xo, xo, attn_mask=attn_mask)[0].squeeze(0)
+            if cross_block is not None:
+                attn_mask = attn_mask.masked_fill(cross_block, float("-inf"))
+            seq = x.unsqueeze(0)
+            for blk in self.blocks:
+                seq = blk(seq, attn_mask)
+            return seq.squeeze(0), None
 
-        attn_scores = self.score_head(x).squeeze(-1)
-        gate_values = self.gate(gate_features).squeeze(-1)
-        per_candidate_gate = gate_values[mention_ids]
-        return per_candidate_gate * attn_scores + (1 - per_candidate_gate) * gilda_scores.squeeze(-1)
+        ctx = F.relu(self.ctx_proj(context_emb.view(1, -1)))
+        seq = torch.cat([ctx, x], dim=0).unsqueeze(0)
+        full_bias = torch.cat([torch.zeros(1, device=key_bias.device), key_bias])
+        attn_mask = full_bias.unsqueeze(0).expand(1 + N, 1 + N).clone()
+        if cross_block is not None:
+            blocked = torch.zeros(1 + N, 1 + N, dtype=torch.bool,
+                                  device=cross_block.device)
+            blocked[1:, 1:] = cross_block
+            attn_mask = attn_mask.masked_fill(blocked, float("-inf"))
+        for blk in self.blocks:
+            seq = blk(seq, attn_mask)
+        out = seq.squeeze(0)
+        return out[1:], out[0]
+
+    def _score(self, x, embeddings):
+        """Handles the scoring of candidates based on their updated representations (and
+        their lexical features if self.feature_skip is True).
+        """
+        if self.feature_skip:
+            x = torch.cat([x, embeddings[:, self.embed_dim:]], dim=-1)
+        return self.score_head(x).squeeze(-1)
+
+    def forward(self, embeddings, context_emb=None, return_hidden=False,
+                mention_ids=None):
+        """Calls self._trunk and self._score to facilitate a forward pass.
+        """
+        x, ctx_hidden = self._trunk(embeddings, context_emb, mention_ids)
+        scores = self._score(x, embeddings)
+        return (scores, x, ctx_hidden) if return_hidden else scores
 
 
 def compute_loss(
