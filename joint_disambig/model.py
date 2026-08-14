@@ -6,6 +6,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+AUX_TYPES = (
+    "Small Molecule", "Biological Function", "Disease", "Tissue/Organ", "Taxon",
+    "Human Gene", "Nonhuman Gene", "Cellular Component", "Cell types/Cell lines",
+    "miRNA",
+)
+AUX_TYPE_IGNORE = -100
+
 BIAS_COLS = [0, 1, 2, 3, 6]
 
 
@@ -61,6 +68,12 @@ class JointDisambiguator(nn.Module):
         If True, re-attach (concatenate) the n_cand_features lexical features to the
         updated vector representations produced by the num_layers TransformerBlock
         blocks.
+    aux_type:
+        If True, turn on per-mention entity type prediction as an auxiliary learning
+        task.
+    n_types:
+        Number of entity type classes that the auxiliary prediction head has to choose
+        from.
     """
 
     wants_context = True
@@ -76,6 +89,8 @@ class JointDisambiguator(nn.Module):
         context_dim=768,
         num_layers=3,
         feature_skip=True,
+        aux_type=True,
+        n_types=len(AUX_TYPES)
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -83,6 +98,8 @@ class JointDisambiguator(nn.Module):
         self.context_dim = context_dim
         self.num_layers = num_layers
         self.feature_skip = feature_skip
+        self.aux_type = aux_type
+        self.n_types = n_types
         self.dropout = nn.Dropout(dropout)
         self.input_proj = nn.Linear(embed_dim + n_cand_features, hidden_dim)
         self.feat_attn_bias = nn.Linear(len(BIAS_COLS), 1)
@@ -93,6 +110,8 @@ class JointDisambiguator(nn.Module):
             for _ in range(num_layers)])
         self.score_head = nn.Linear(
             hidden_dim + (n_cand_features if feature_skip else 0), 1)
+        if aux_type:
+            self.type_head = nn.Linear(hidden_dim, n_types)
 
     def _trunk(self, embeddings, context_emb, mention_ids=None):
         """Handles the sending of the CTX and candidate embeddings through
@@ -144,6 +163,21 @@ class JointDisambiguator(nn.Module):
         x, ctx_hidden = self._trunk(embeddings, context_emb, mention_ids)
         scores = self._score(x, embeddings)
         return (scores, x, ctx_hidden) if return_hidden else scores
+
+    def compute_aux_loss(self, x, mention_ids, type_targets, w_type=0.2):
+        """Per-mention cross-entropy loss for entity type prediction. Best `w_type` was
+        found to be 0.2 based on validation loss.
+        """
+        if not (self.aux_type and w_type > 0 and type_targets is not None
+                and (type_targets != AUX_TYPE_IGNORE).any()):
+            return x.new_zeros(())
+        M = int(mention_ids.max().item()) + 1
+        pooled = x.new_zeros(M, x.size(1)).index_add_(0, mention_ids, x)
+        counts = x.new_zeros(M).index_add_(
+            0, mention_ids, x.new_ones(mention_ids.shape[0]))
+        pooled = pooled / counts.clamp(min=1.0).unsqueeze(1)
+        return w_type * F.cross_entropy(self.type_head(pooled), type_targets,
+                                        ignore_index=AUX_TYPE_IGNORE)
 
 
 def compute_loss(
