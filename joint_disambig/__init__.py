@@ -1,9 +1,15 @@
-"""Joint disambiguation module for Gilda that uses PubMedBERT embeddings and self-attention.
+"""Joint disambiguation module for Gilda that uses PubMedBERT embeddings and
+self-attention.
 
-The default model is a GatedJointDisambiguator with rich embeddings;
-candidates are embedded using their full name + namespace label via frozen
-PubMedBERT, and a learned confidence gate blends the attention signal with
-Gilda's original lexical scores.
+Candidates are embedded using their full name and namespace label via a frozen
+PubMedBERT model, concatenated with a 10-d status/string-match vector, and
+re-ranked jointly based on their representations after being passed through a
+stack of transformer blocks.
+
+One forward pass takes all mentions from a single document/source, lets them
+attend to each others vector representations (as well as a per-document CTX
+token built from embedding all mention spans as one string), and infers
+per-mention which candidate should be ranked highest.
 """
 from typing import Optional
 
@@ -43,21 +49,11 @@ def disambiguate(
 
     if _model is None:
         import torch
-        from .model import GatedJointDisambiguator
         from .embedder import CandidateEmbedder
+        from .train import load_model
 
-        # Load checkpoint (supports both gated and plain models)
+        _model = load_model(model_path, device=device)
         ckpt = torch.load(model_path, map_location=device, weights_only=True)
-        model_type = ckpt.get("model_type", "JointDisambiguator")
-
-        if model_type == "GatedJointDisambiguator":
-            _model = GatedJointDisambiguator(**ckpt["config"])
-        else:
-            from .model import JointDisambiguator
-            _model = JointDisambiguator(**ckpt["config"])
-
-        _model.load_state_dict(ckpt["state_dict"])
-        _model.eval()
 
         # Use rich embeddings if the checkpoint was trained with them
         embedding_mode = ckpt.get("embedding_mode", "plain")
@@ -74,5 +70,8 @@ def disambiguate(
         _jr = JointReranker(_model, grounder=None, device=device, cache=_cache, embedder=_embedder)
 
     texts = list(mention_candidates.keys())
-    ranked = _jr.rerank([mention_candidates[t] for t in texts])
+    ctx = None
+    if getattr(_model, "wants_context", False) and texts:
+        ctx = _embedder.embed_text(", ".join(dict.fromkeys(texts)), max_length=512)
+    ranked = _jr.rerank([mention_candidates[t] for t in texts], context_emb=ctx)
     return dict(zip(texts, ranked))
