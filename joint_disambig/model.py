@@ -151,8 +151,10 @@ def compute_loss(
     mention_ids: torch.Tensor,
     gold_indices: torch.Tensor,
     temperature: float = 1.0,
+    weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Computes per-mention cross-entropy loss and averages over valid mentions.
+    """Computes per-mention cross-entropy loss averaged over mentions whose gold
+     is reachable.
 
     Params:
     -------
@@ -169,22 +171,29 @@ def compute_loss(
         distribution (when < 1), which restores gradient magnitude if the scores have
         a narrow range. Ranking within a mention is invariant to this, so evaluation is
         unaffected and only the training gradients change. Default is 1.0.
-
+    weights : (M,) or None
+        Per-mention loss weights for class rebalancing
+        
     Returns:
     --------
     loss : scalar torch.Tensor
     """
-    losses = []
+    losses, ws = [], []
     for m_id in range(gold_indices.shape[0]):
         gold_idx = gold_indices[m_id].item()
         if gold_idx < 0:
             continue
-        mask = mention_ids == m_id
-        mention_scores = scores[mask]
+        mention_scores = scores[mention_ids == m_id]
         if mention_scores.shape[0] == 0:
             continue
         log_probs = F.log_softmax(mention_scores / temperature, dim=0)
         losses.append(-log_probs[gold_idx])
+        if weights is not None:
+            ws.append(weights[m_id])
     if not losses:
         return torch.tensor(0.0, requires_grad=True, device=scores.device)
-    return torch.stack(losses).mean()
+    stacked = torch.stack(losses)
+    if weights is None:
+        return stacked.mean()
+    w = torch.stack(ws).to(stacked.dtype)
+    return (stacked * w).sum() / w.sum().clamp_min(1e-8)
