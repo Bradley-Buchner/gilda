@@ -181,10 +181,10 @@ class CandidateEmbedder:
             all_vecs.append(out.last_hidden_state[:, 0, :].cpu().numpy())
         return np.concatenate(all_vecs, axis=0)
 
-    def embed_text(self, text: str) -> np.ndarray:
+    def embed_text(self, text: str, max_length: int = 128) -> np.ndarray:
         """Embed a single text string.
         """
-        return self.embed_texts([text])[0]
+        return self.embed_texts([text], max_length=max_length)[0]
 
     def embed_candidate(self, term) -> np.ndarray:
         """Embed a Gilda Term and cache its embedding by the key "(db, id)".
