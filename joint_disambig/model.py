@@ -5,6 +5,27 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class TransformerBlock(nn.Module):
+    def __init__(self, hidden_dim, n_heads, dropout):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(hidden_dim, n_heads, dropout=dropout,
+                                          batch_first=True)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.ff = nn.Sequential(
+            nn.Linear(hidden_dim, 4*hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(4 * hidden_dim, hidden_dim)
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, seq, attn_mask):
+        a, _ = self.attn(seq, seq, seq, attn_mask=attn_mask, need_weights=False)
+        seq = self.norm1(seq + self.dropout(a))
+        return self.norm2(seq + self.ff(seq))
+
+
 class JointDisambiguator(nn.Module):
     """Disambiguates a mention's Gilda candidates by attending to the Gilda
     candidates of other mentions from the same source (document, experimental
