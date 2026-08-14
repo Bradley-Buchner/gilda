@@ -1,7 +1,8 @@
-"""BioCreative Bio-ID corpus loading and preprocessing for joint disambiguation.
+"""Corpus loading and preprocessing for joint disambiguation.
 
-Imports utilities for ID normalization, entity type classification, synonym expansion, and organism priority from the
-BioIDBenchmarker class and module-level helpers in gilda/benchmarks/bioid_evaluation.py.
+Imports utilities for ID normalization, entity type classification,
+synonym expansion, and organism priority from the BioIDBenchmarker class
+and module-level helpers in gilda/benchmarks/bioid_evaluation.py.
 """
 import json
 import os
@@ -623,6 +624,15 @@ def _classify_entity_type(obj: list[str], obj_synonyms: set[str]) -> str:
         return "Nonhuman Gene"
     return "other" if etype == "unknown" else etype
 
+
+# Namespace-to-semantic type map used in train.py
+NS_TYPE = {
+    "HGNC": "gene", "FPLX": "gene", "UP": "gene", "UPPRO": "gene", "IP": "gene",
+    "PF": "gene", "CHEBI": "chem", "PUBCHEM": "chem", "DRUGBANK": "chem",
+    "CHEMBL": "chem", "HMDB": "chem", "MESH": "MeSH", "NCIT": "NCIT",
+    "DOID": "dis", "MONDO": "dis", "EFO": "trait", "HP": "phen", "GO": "proc",
+    "CL": "cell", "BTO": "tissue", "TAXONOMY": "org",
+}
 
 # Map each BigBio dataset's entity types to names that match those used by
 # BioIDBenchmarker._get_entity_type for making grouped evaluation tables
