@@ -1,13 +1,16 @@
-"""Training loop, embedding precomputation, and inference for joint
-disambiguation"""
+"""Training loop, embedding precomputation, variance penalty, and inference for joint
+disambiguation.
+"""
 import copy
 import os
 import pickle
 from typing import Optional
 import numpy as np
 import torch
+import collections
+import random
 
-from .data import DocumentExample
+from .data import DocumentExample, NS_TYPE
 from .embedder import CandidateEmbedder, _build_embedding_text, DEFAULT_MODEL
 from .model import JointDisambiguator, compute_loss, AUX_TYPES, AUX_TYPE_IGNORE
 from .rerank import JointReranker
@@ -93,6 +96,30 @@ def _context_tensor(context_cache, doc_id, device):
     return torch.tensor(v, dtype=torch.float32, device=device) if v is not None else None
 
 
+def _env_labels(docs, ns_purity=0.5):
+    """Give each document an environment label based on the composition of its gold
+    namespaces. For implementing the Variance Risk Extrapolation (V-REx) method.
+
+    For example, if the proportion of gold namespaces in a document that are HGNC
+    exceeds `ns_purity`, then that document is given an environment label of 'ns:gene'.
+    If no namespace proportion exceeds `ns_purity`, a document is labeled as 'ns:mixed'.
+    Documents with no gold labels are labeled 'ns:none'.
+    """
+    out = {}
+    for d in docs:
+        hist = collections.Counter()
+        for m in d.mentions:
+            if m.gold_index is not None and m.candidates:
+                hist[NS_TYPE.get(m.candidates[m.gold_index].term.db, "other")] += 1
+        n = sum(hist.values())
+        if not n:
+            out[d.doc_id] = "ns:none"
+            continue
+        top, c = hist.most_common(1)[0]
+        out[d.doc_id] = f"ns:{top}" if c / n >= ns_purity else "ns:mixed"
+    return out
+
+
 def train(
     train_docs: list[DocumentExample],
     val_docs: list[DocumentExample],
@@ -103,30 +130,87 @@ def train(
     epochs: int = 120,
     lr: float = 5e-5,
     weight_decay: float = 0.0,
+    grad_accum: int = 8,
+    seed: int = 0,
     patience: int = 20,
     device: str = "cpu",
     context_cache: Optional[dict] = None,
-    aux_type_weight: float = 0.0
+    aux_type_weight: float = 0.0,
+    vrex_beta: float = 0.0,
+    vrex_warmup: int = 5,
+    vrex_min_docs: int = 50,
+    vrex_ns_purity: float = 0.5,
 ) -> JointDisambiguator:
     """Train with early stopping on validation loss and return the best checkpoint.
     `context_cache` feeds the per-document CTX token and should always be supplied.
     """
+    if not val_docs:
+        raise ValueError("val_docs is empty")
+
     device = torch.device(device)
     jr = JointReranker(model, grounder, device=device, cache=embedding_cache)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     best_val_loss = float("inf")
     best_state = None
     patience_counter = 0
+    rng = random.Random(seed)
     type_to_id = {t: i for i, t in enumerate(AUX_TYPES)}
     use_aux = aux_type_weight > 0
 
+    # Establish V-REx environments. Keep those with >= `vrex_min_docs`, drop 'ns:none'.
+    # Dropped environments still contribute to the mean risk, but not variance risk.
+    env_of = _env_labels(train_docs, vrex_ns_purity)
+    _env_n = collections.Counter(env_of[d.doc_id] for d in train_docs)
+    _env_n.pop("ns:none", None)
+    vrex_envs = {k for k, c in _env_n.items() if c >= vrex_min_docs}
+    if vrex_beta > 0:
+        print(f"[v-rex] beta={vrex_beta}  warmup={vrex_warmup} epochs  "
+              f"purity={vrex_ns_purity}")
+        print(f"[v-rex] {len(vrex_envs)} environments kept: "
+              + ", ".join(f"{k}({_env_n[k]})" for k, _ in _env_n.most_common()
+                          if k in vrex_envs))
+        dropped = [k for k in _env_n if k not in vrex_envs]
+        if dropped:
+            print(f"[v-rex] dropped (< {vrex_min_docs} docs): "
+                  + ", ".join(f"{k}({_env_n[k]})" for k in dropped))
+
+    def _vrex_penalty(win, beta_now):
+        """Applies the V-REx penalty to the objective for one 'batch' of documents.
+
+        Returns the tuple (objective, variance) for one gradient-accumulation window
+        (batch) where objective = mean risk over all losses + beta_now * variance over
+        per-environment mean risks (computed only for `vrex_envs` members).
+        """
+        risk = torch.stack([l for _, l in win]).mean()
+        by_env = collections.defaultdict(list)
+        for e, l in win:
+            if e in vrex_envs:
+                by_env[e].append(l)
+        if len(by_env) < 2:
+            return risk, None
+        env_risk = torch.stack([torch.stack(ls).mean() for ls in by_env.values()])
+        v = env_risk.var(unbiased=True)
+        return risk + beta_now * v, v
+
     for epoch in range(epochs):
-        # Train for one epoch
+        # --- train ---
         model.train()
         train_loss = 0.0
         n_train = 0
-        for doc in train_docs:
+        optimizer.zero_grad()
+        accum = 0
+        window = []
+        vrex_var_sum = 0.0
+        vrex_var_n = 0
+        vrex_erm_windows = 0
+        beta_now = vrex_beta * min(1.0, (epoch + 1) / max(vrex_warmup, 1))
+
+        # Shuffle to decorrelate batches
+        docs_order = list(train_docs)
+        rng.shuffle(docs_order)
+
+        for doc in docs_order:
             tensors = jr.build_model_tensors([m.candidates for m in doc.mentions])
             if tensors is None:
                 continue
@@ -150,13 +234,43 @@ def train(
                     x_hidden, mids, type_t, aux_type_weight)
             if loss.item() == 0.0:
                 continue
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
             train_loss += loss.item()
             n_train += 1
 
-        # Validate after training for one epoch
+            # --- apply variance penalty ---
+            if vrex_beta > 0:  # i.e., if vrex is ON
+                window.append((env_of[doc.doc_id], loss))
+                accum += 1
+                if accum < grad_accum:
+                    continue
+                total, v = _vrex_penalty(window, beta_now)
+                if v is None:
+                    vrex_erm_windows += 1
+                else:
+                    vrex_var_sum += float(v.detach())
+                    vrex_var_n += 1
+                total.backward()
+                optimizer.step()
+                optimizer.zero_grad()
+                accum = 0
+                window = []
+                continue
+
+            (loss / grad_accum).backward()
+            accum += 1
+            if accum == grad_accum:
+                optimizer.step()
+                optimizer.zero_grad()
+                accum = 0
+
+        if accum > 0:
+            if vrex_beta > 0 and window:
+                torch.stack([l for _, l in window]).mean().backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            window = []
+
+        # --- eval ---
         model.eval()
         val_loss = 0.0
         n_val = 0
@@ -178,8 +292,12 @@ def train(
 
         avg_train = train_loss / max(n_train, 1)
         avg_val = val_loss / max(n_val, 1)
+        vx = (f"vrex_var={vrex_var_sum / vrex_var_n:.2e} beta={beta_now:.1f}"
+              if vrex_var_n else "")
+        if vrex_beta > 0 and vrex_erm_windows:
+            vx += f"erm_windows={vrex_erm_windows}"
         print(f"Epoch {epoch+1}/{epochs}  train_loss={avg_train:.4f}  "
-              f"val_loss={avg_val:.4f}")
+              f"val_loss={avg_val:.4f}{vx}")
 
         if avg_val < best_val_loss:
             best_val_loss = avg_val
@@ -305,6 +423,11 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument("--grad-accum", type=int, default=8,
+                        help="documents per optimizer step (effective batch size in docs)")
+    parser.add_argument("--weight-decay", type=float, default=0.0,
+                        help="AdamW weight decay")
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--hidden-dim", type=int, default=128,
                         help="hidden layer width")
     parser.add_argument("--n-heads", type=int, default=4)
@@ -316,6 +439,17 @@ if __name__ == "__main__":
                              "post-trunk rep. before the score head")
     parser.add_argument("--aux-type-weight", type=float, default=0.0,
                         help="weight of loss term from per-mention entity-type prediction")
+    parser.add_argument("--vrex-beta", type=float, default=0.0,
+                        help="coefficient for V-REx penalty in loss")
+    parser.add_argument("--vrex-warmup", type=int, default=5,
+                        help="epochs over which beta ramps linearly from 0")
+    parser.add_argument("--vrex-min-docs", type=int, default=50,
+                        help="drop environments with fewer training docs than this from "
+                             "the variance term to avoid adding noise")
+    parser.add_argument("--vrex-ns-purity", type=float, default=0.5,
+                        help="share of a document's labeled mentions the argmax gold "
+                             "type must hold for the document to be assigned to that "
+                             "environment instead of ns:mixed")
     parser.add_argument("--datasets", nargs="+", default=["bioid"],
                         help="sources to combine, e.g. 'bioid bc5cdr nlmchem "
                              "ncbi_disease'. Default is 'bioid' (original pipeline).")
@@ -365,18 +499,22 @@ if __name__ == "__main__":
 
     model = train(
         train_docs, val_docs, cache, model, grounder,
-        epochs=args.epochs, lr=args.lr, patience=args.patience,
-        device=args.device, temperature=args.temperature,
-        context_cache=ctx_cache,
+        epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
+        grad_accum=args.grad_accum, seed=args.seed, patience=args.patience,
         device=args.device, context_cache=ctx_cache,
-        aux_type_weight=args.aux_type_weight
+        aux_type_weight=args.aux_type_weight,
+        vrex_beta=args.vrex_beta, vrex_warmup=args.vrex_warmup,
+        vrex_min_docs=args.vrex_min_docs, vrex_ns_purity=args.vrex_ns_purity,
     )
 
     save_model(model, args.output, embedding_mode="rich", train_config={
-        "epochs": args.epochs, "lr": args.lr, "patience": args.patience,
+        "epochs": args.epochs, "lr": args.lr, "weight_decay": args.weight_decay,
+        "grad_accum": args.grad_accum, "seed": args.seed, "patience": args.patience,
         "dropout": args.dropout, "num_layers": args.num_layers,
         "feature_skip": args.feature_skip, "datasets": args.datasets,
         "aux_type_weight": args.aux_type_weight,
+        "vrex_beta": args.vrex_beta, "vrex_warmup": args.vrex_warmup,
+        "vrex_min_docs": args.vrex_min_docs, "vrex_ns_purity": args.vrex_ns_purity,
         "encoder_model": DEFAULT_MODEL,
     })
     print(f"Model saved to {args.output}")
