@@ -8,11 +8,8 @@ import numpy as np
 import torch
 
 from .data import DocumentExample
-from .embedder import CandidateEmbedder, _build_embedding_text
-from .model import (JointDisambiguator, GatedJointDisambiguator,
-                    GatedGildaBiasDisambiguator, GatedGateOnlyDisambiguator,
-                    GatedGFeatDisambiguator, GatedGFeatStatusExactBiasDisambiguator,
-                    GatedGFeatStatusExactCtxDisambiguator, compute_loss)
+from .embedder import CandidateEmbedder, _build_embedding_text, DEFAULT_MODEL
+from .model import JointDisambiguator, compute_loss, AUX_TYPES, AUX_TYPE_IGNORE
 from .rerank import JointReranker
 from gilda import Grounder
 
@@ -62,8 +59,7 @@ def precompute_context_embeddings(
     cache_path: Optional[str] = None,
     max_length: int = 512,
 ) -> dict[str, np.ndarray]:
-    """Embed one context string per document. Used by models that have
-    wants_context=True.
+    """Embed one context string per document.
     """
     if cache_path and os.path.exists(cache_path):
         with open(cache_path, "rb") as f:
@@ -104,17 +100,16 @@ def train(
     model: JointDisambiguator,
     grounder: Grounder,
     *,
-    epochs: int = 20,
-    lr: float = 1e-3,
-    patience: int = 5,
+    epochs: int = 120,
+    lr: float = 5e-5,
+    weight_decay: float = 0.0,
+    patience: int = 20,
     device: str = "cpu",
-    cross_mention_only: bool = False,
-    temperature: float = 1.0,
     context_cache: Optional[dict] = None,
+    aux_type_weight: float = 0.0
 ) -> JointDisambiguator:
-    """Train a model with early stopping on validation loss and return the
-    best model checkpoint. 'context_cache' feeds the document-context token
-    for models with wants_context=True and is ignored otherwise.
+    """Train with early stopping on validation loss and return the best checkpoint.
+    `context_cache` feeds the per-document CTX token and should always be supplied.
     """
     device = torch.device(device)
     jr = JointReranker(model, grounder, device=device, cache=embedding_cache)
@@ -123,6 +118,8 @@ def train(
     best_val_loss = float("inf")
     best_state = None
     patience_counter = 0
+    type_to_id = {t: i for i, t in enumerate(AUX_TYPES)}
+    use_aux = aux_type_weight > 0
 
     for epoch in range(epochs):
         # Train for one epoch
@@ -134,15 +131,23 @@ def train(
             if tensors is None:
                 continue
             embs, gs, mids, gate_feats = tensors
+            with_cands = [m for m in doc.mentions if m.candidates]
             golds = torch.tensor(
-                [m.gold_index if m.gold_index is not None else -1
-                 for m in doc.mentions if m.candidates],
+                [m.gold_index if m.gold_index is not None else -1 for m in with_cands],
                 dtype=torch.long, device=device)
             ctx = _context_tensor(context_cache, doc.doc_id, device)
-            scores = jr.model(embs, gs, mids, gate_feats,
-                              cross_mention_only=cross_mention_only,
-                              context_emb=ctx)
+            if use_aux:
+                scores, x_hidden, _ctx_hidden = jr.model(
+                    embs, context_emb=ctx, return_hidden=True)
+            else:
+                scores = jr.model(embs, context_emb=ctx)
             loss = compute_loss(scores, mids, golds)
+            if use_aux:
+                type_t = torch.tensor(
+                    [type_to_id.get(m.entity_type, AUX_TYPE_IGNORE) for m in with_cands],
+                    dtype=torch.long, device=device)
+                loss = loss + jr.model.compute_aux_loss(
+                    x_hidden, mids, type_t, aux_type_weight)
             if loss.item() == 0.0:
                 continue
             optimizer.zero_grad()
@@ -161,17 +166,14 @@ def train(
                 if tensors is None:
                     continue
                 embs, gs, mids, gate_feats = tensors
+                with_cands = [m for m in doc.mentions if m.candidates]
                 golds = torch.tensor(
                     [m.gold_index if m.gold_index is not None else -1
-                     for m in doc.mentions if m.candidates],
-                    dtype=torch.long, device=device
-                )
+                     for m in with_cands],
+                    dtype=torch.long, device=device)
                 ctx = _context_tensor(context_cache, doc.doc_id, device)
-                scores = jr.model(embs, gs, mids, gate_feats,
-                                  cross_mention_only=cross_mention_only,
-                                  context_emb=ctx)
-                loss = compute_loss(scores, mids, golds)
-                val_loss += loss.item()
+                scores = jr.model(embs, context_emb=ctx)
+                val_loss += compute_loss(scores, mids, golds).item()
                 n_val += 1
 
         avg_train = train_loss / max(n_train, 1)
@@ -217,13 +219,11 @@ def predict_document(
         context_cache: Optional[dict] = None,
 ) -> dict[str, list]:
     """Run inference on a single document and return {mention_text: re-ranked
-    ScoredMatch list}. 'context_cache' feeds the document-context token
-    for models with wants_context=True and is ignored otherwise.
+    ScoredMatch list}. `context_cache` feeds the document-context token.
     """
     jr = _get_reranker(model, embedding_cache, device)
     with_cands = [m for m in doc.mentions if m.candidates]
-    ctx = _context_tensor(context_cache, doc.doc_id, device) \
-        if getattr(model, "wants_context", False) else None
+    ctx = _context_tensor(context_cache, doc.doc_id, device)
     ranked = jr.rerank([m.candidates for m in with_cands],
                        context_emb=ctx) if with_cands else []
     results = {m.text: r for m, r in zip(with_cands, ranked)}
@@ -232,26 +232,48 @@ def predict_document(
     return results
 
 
+# Checkpoints trained before the model.py rewrite have 10 extra config keys
+# (the disabled aux heads, pre_norm, n_namespaces, n_coarse, defn_dim) for
+# architecture variants that were deprecated. Need this list of keys for
+# loading the model.
+_MODEL_CONFIG_KEYS = {"embed_dim", "hidden_dim", "n_heads", "dropout",
+                      "n_cand_features", "context_dim", "num_layers",
+                      "feature_skip", "aux_type", "n_types"}
+
+# `model_type` values used before the model.py rewrite. There is now one
+# architecture (JointDisambiguator), so this is just a safety guard. Need this list
+# of keys for loading the model.
+_KNOWN_MODEL_TYPES = {"JointDisambiguator", "MultiLayerCtxUngatedDisambiguator"}
+
+# Checkpoints trained before the model.py rewrite also have a now-deprecated
+# `attention.*` key in the model_state dict. Need this for loading the model.
+_DEAD_STATE_PREFIXES = ("attention.",)
+
+
 def save_model(model: JointDisambiguator, path: str,
-               embedding_mode: str = "plain"):
+               embedding_mode: str = "rich",
+               train_config: Optional[dict] = None):
     """Save model checkpoint to disk with model type and embedding mode
     metadata.
     """
-    model_type = type(model).__name__
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     torch.save({
         "state_dict": model.state_dict(),
-        "model_type": model_type,
-        "config": {
-            "embed_dim": getattr(model, "embed_dim", model.input_proj.in_features - 1),
+        "model_type": type(model).__name__,
+         "config": {
+            "embed_dim": model.embed_dim,
             "hidden_dim": model.input_proj.out_features,
-            "n_heads": model.attention.num_heads,
-            **({"n_cand_features": model.n_cand_features}
-               if hasattr(model, "n_cand_features") else {}),
-            **({"context_dim": model.context_dim}
-               if hasattr(model, "context_dim") else {}),
+            "n_heads": model.blocks[0].attn.num_heads,
+            "dropout": model.dropout.p,
+            "n_cand_features": model.n_cand_features,
+            "context_dim": model.context_dim,
+            "num_layers": model.num_layers,
+            "feature_skip": model.feature_skip,
+            "aux_type": model.aux_type,
+            "n_types": model.n_types,
         },
         "embedding_mode": embedding_mode,
+        **({"train_config": train_config} if train_config else {}),
     }, path)
 
 
@@ -260,21 +282,15 @@ def load_model(path: str, device: str = "cpu") -> JointDisambiguator:
     """
     ckpt = torch.load(path, map_location=device, weights_only=True)
     model_type = ckpt.get("model_type", "JointDisambiguator")
-    if model_type == "GatedGFeatStatusExactCtxDisambiguator":
-        model = GatedGFeatStatusExactCtxDisambiguator(**ckpt["config"])
-    elif model_type == "GatedGFeatStatusExactBiasDisambiguator":
-        model = GatedGFeatStatusExactBiasDisambiguator(**ckpt["config"])
-    elif model_type == "GatedGFeatDisambiguator":
-        model = GatedGFeatDisambiguator(**ckpt["config"])
-    elif model_type == "GatedGateOnlyDisambiguator":
-        model = GatedGateOnlyDisambiguator(**ckpt["config"])
-    elif model_type == "GatedGildaBiasDisambiguator":
-        model = GatedGildaBiasDisambiguator(**ckpt["config"])
-    elif model_type == "GatedJointDisambiguator":
-        model = GatedJointDisambiguator(**ckpt["config"])
-    else:
-        model = JointDisambiguator(**ckpt["config"])
-    model.load_state_dict(ckpt["state_dict"])
+    if model_type not in _KNOWN_MODEL_TYPES:
+        raise ValueError(
+            f"{path!r} was trained with an invalid model_type ({model_type!r}). Choose "
+            f"one of {sorted(_KNOWN_MODEL_TYPES)}.")
+    config = {k: v for k, v in ckpt["config"].items() if k in _MODEL_CONFIG_KEYS}
+    state = {k: v for k, v in ckpt["state_dict"].items()
+             if not k.startswith(_DEAD_STATE_PREFIXES)}
+    model = JointDisambiguator(**config)
+    model.load_state_dict(state)
     model.eval()
     return model
 
@@ -286,33 +302,34 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(
         description="Train joint disambiguation model")
-    parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--patience", type=int, default=10)
-    parser.add_argument("--device", default="cpu")
-    parser.add_argument("--output", default="joint_disambig/model_checkpoint.pt")
-    parser.add_argument("--embedding-cache",
-                        default="joint_disambig/embedding_cache_rich.pkl")
-    parser.add_argument("--context-cache", default=None,
-                        help="path to/for the per-document context embedding "
-                             "cache (required for gated_gfeat_statusexactctx)")
-    parser.add_argument("--equivalences", default=None,
-                        help="Path to equivalences.json")
-    parser.add_argument("--model-type",
-                        choices=["plain", "gated", "gated_gbias", "gated_gateonly",
-                                 "gated_gfeat", "gated_gfeat_statusexactbias",
-                                 "gated_gfeat_statusexactctx"],
-                        default="gated",
-                        help="Model variant")
-    parser.add_argument("--temperature", type=float, default=1.0,
-                        help="Temperature param for sharpening the logit"
-                             "distribution")
+    parser.add_argument("--epochs", type=int, default=120)
+    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument("--hidden-dim", type=int, default=128,
+                        help="hidden layer width")
+    parser.add_argument("--n-heads", type=int, default=4)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--num-layers", type=int, default=3,
+                        help="number of stacked transformer blocks")
+    parser.add_argument("--feature-skip", action="store_true",
+                        help="if True, concatenate raw candidate features onto the "
+                             "post-trunk rep. before the score head")
+    parser.add_argument("--aux-type-weight", type=float, default=0.0,
+                        help="weight of loss term from per-mention entity-type prediction")
     parser.add_argument("--datasets", nargs="+", default=["bioid"],
-                        help="Sources to combine, e.g. 'bioid bc5cdr nlmchem "
+                        help="sources to combine, e.g. 'bioid bc5cdr nlmchem "
                              "ncbi_disease'. Default is 'bioid' (original pipeline).")
     parser.add_argument("--corpus-cache", default=None,
-                        help="Path to cache or load the merged corpus pickle "
+                        help="path to cache or load the merged corpus pickle "
                              "(skips re-grounding on re-runs).")
+    parser.add_argument("--embedding-cache",
+                        default="joint_disambig/embedding_cache_tier2.pkl")
+    parser.add_argument("--context-cache", default=None,
+                        help="path to/for the per-document CTX embedding cache")
+    parser.add_argument("--equivalences", default=None,
+                        help="path to equivalences.json")
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--output", default="joint_disambig/model_checkpoint.pt")
     args = parser.parse_args()
 
     from .data import load_corpus, make_splits, report_statistics
@@ -332,35 +349,34 @@ if __name__ == "__main__":
           f"{len(test_docs)} test")
 
     # Rich embeddings (pass grounder for full names + species labels)
-    embedder = CandidateEmbedder(device=args.device, grounder=grounder)
+    embedder = CandidateEmbedder(model_name=DEFAULT_MODEL,
+                                 device=args.device, grounder=grounder)
     cache = precompute_embeddings(train_docs + val_docs + test_docs,
                                   embedder, args.embedding_cache)
+    ctx_cache = precompute_context_embeddings(train_docs + val_docs + test_docs,
+                                              embedder, args.context_cache)
 
-    if args.model_type == "gated_gfeat_statusexactctx":
-        model = GatedGFeatStatusExactCtxDisambiguator(embed_dim=embedder.embed_dim)
-    elif args.model_type == "gated_gfeat_statusexactbias":
-        model = GatedGFeatStatusExactBiasDisambiguator(embed_dim=embedder.embed_dim)
-    elif args.model_type == "gated_gfeat":
-        model = GatedGFeatDisambiguator(embed_dim=embedder.embed_dim)
-    elif args.model_type == "gated_gateonly":
-        model = GatedGateOnlyDisambiguator(embed_dim=embedder.embed_dim)
-    elif args.model_type == "gated_gbias":
-        model = GatedGildaBiasDisambiguator(embed_dim=embedder.embed_dim)
-    elif args.model_type == "gated":
-        model = GatedJointDisambiguator(embed_dim=embedder.embed_dim)
-    else:
-        model = JointDisambiguator(embed_dim=embedder.embed_dim)
-
-    ctx_cache = None
-    if getattr(model, "wants_context", False):
-        ctx_cache = precompute_context_embeddings(
-            train_docs + val_docs + test_docs, embedder, args.context_cache)
+    torch.manual_seed(args.seed)
+    model = JointDisambiguator(
+        embed_dim=embedder.embed_dim, hidden_dim=args.hidden_dim,
+        n_heads=args.n_heads, dropout=args.dropout,
+        num_layers=args.num_layers, feature_skip=args.feature_skip,
+        aux_type=args.aux_type_weight > 0, n_types=len(AUX_TYPES))
 
     model = train(
         train_docs, val_docs, cache, model, grounder,
         epochs=args.epochs, lr=args.lr, patience=args.patience,
         device=args.device, temperature=args.temperature,
         context_cache=ctx_cache,
+        device=args.device, context_cache=ctx_cache,
+        aux_type_weight=args.aux_type_weight
     )
-    save_model(model, args.output, embedding_mode="rich")
+
+    save_model(model, args.output, embedding_mode="rich", train_config={
+        "epochs": args.epochs, "lr": args.lr, "patience": args.patience,
+        "dropout": args.dropout, "num_layers": args.num_layers,
+        "feature_skip": args.feature_skip, "datasets": args.datasets,
+        "aux_type_weight": args.aux_type_weight,
+        "encoder_model": DEFAULT_MODEL,
+    })
     print(f"Model saved to {args.output}")
